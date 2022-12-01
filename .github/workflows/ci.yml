@@ -19,6 +19,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: npm ci
+      - run: npm run type-check
       - run: npm test
       # the codecov uploader only runs on unix,
       # frequently hangs for whatever reason,

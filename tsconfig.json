@@ -20,16 +20,7 @@
     "noImplicitReturns": true,
     "noImplicitOverride": true,
     "noUncheckedIndexedAccess": true,
-
-    "incremental": true,
-    "tsBuildInfoFile": ".build/tsconfig.build.tsbuildinfo",
-
-    "declaration": true,
-    // "declarationMap": true,
-    "sourceMap": true,
-
-    "outDir": ".build"
   },
-  "include": ["src", "tests", "rollup.config.ts"],
+  "include": ["src", "tests"],
   "exclude": ["tests/testcases", "tests/preprocess"]
 }
