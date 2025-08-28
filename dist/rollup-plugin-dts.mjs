@@ -814,7 +814,9 @@ function preProcessNamespaceBody(body, code, sourceFile) {
             duplicateExports(code, stmt);
         }
         // Rewrite `import =` to `type =`
-        if (ts.isImportEqualsDeclaration(stmt)) {
+        if (ts.isImportEqualsDeclaration(stmt) &&
+            // Add this condition to avoid rewriting local aliases
+            !ts.isIdentifier(stmt.moduleReference)) {
             const importKeyword = stmt.getChildren().find((child) => child.kind === ts.SyntaxKind.ImportKeyword);
             if (importKeyword) {
                 code.overwrite(importKeyword.getStart(sourceFile), importKeyword.getEnd(), "type");
