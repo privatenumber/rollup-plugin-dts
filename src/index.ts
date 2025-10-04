@@ -34,16 +34,36 @@ function logMemory(label: string) {
   console.log(`[${timestamp}] [${label}] Heap: ${(mem.heapUsed / 1024 / 1024).toFixed(2)}MB, RSS: ${(mem.rss / 1024 / 1024).toFixed(2)}MB`);
 }
 
+// Track module resolution to detect cycles
+const moduleResolutionStack: string[] = [];
+const moduleResolutionCount = new Map<string, number>();
+
 function getModule(
   { entries, programs, resolvedOptions: { compilerOptions, tsconfig } }: DtsPluginContext,
   fileName: string,
   code: string,
 ): ResolvedModule | null {
+  // Track cycles and repeated calls
+  const count = (moduleResolutionCount.get(fileName) || 0) + 1;
+  moduleResolutionCount.set(fileName, count);
+
   if (process.env.DTS_DEBUG) {
     const shortPath = fileName.split('/').slice(-3).join('/');
-    console.log(`[getModule] Processing: ${shortPath}, programs: ${programs.length}, isDTS: ${DTS_EXTENSIONS.test(fileName)}`);
+
+    // Check if this file is already in the stack (cycle detection)
+    const cycleIndex = moduleResolutionStack.indexOf(fileName);
+    if (cycleIndex >= 0) {
+      console.log(`\n🔄 [CYCLE DETECTED] ${shortPath} (call #${count})`);
+      console.log(`   Cycle path: ${moduleResolutionStack.slice(cycleIndex).map(f => f.split('/').slice(-2).join('/')).join(' -> ')} -> ${shortPath}`);
+    } else if (count > 1) {
+      console.log(`\n⚠️  [REPEATED] ${shortPath} (call #${count})`);
+    }
+
+    console.log(`[getModule] Processing: ${shortPath}, programs: ${programs.length}, isDTS: ${DTS_EXTENSIONS.test(fileName)}, depth: ${moduleResolutionStack.length}`);
     logMemory(`getModule start: ${shortPath}`);
   }
+
+  moduleResolutionStack.push(fileName);
 
   // Create any `ts.SourceFile` objects on-demand for ".d.ts" modules,
   // but only when there are zero ".ts" entry points.
@@ -51,6 +71,7 @@ function getModule(
     if (process.env.DTS_DEBUG) {
       console.log('[getModule] Fast path: no programs, returning code only');
     }
+    moduleResolutionStack.pop();
     return { code };
   }
 
@@ -84,6 +105,7 @@ function getModule(
     }
     // we know this exists b/c of the .filter above, so this non-null assertion is safe
     const source = existingProgram.getSourceFile(fileName)!;
+    moduleResolutionStack.pop();
     return {
       code: source?.getFullText(),
       source,
@@ -95,18 +117,18 @@ function getModule(
     // large external packages like type-fest.
     if (programs.length > 0 && DTS_EXTENSIONS.test(fileName)) {
       // Check if this file would be treated as an external library by any existing program
-      const isExternalLibrary = programs.some((p) => {
-        const sourceFile = p.getSourceFile(fileName);
-        return sourceFile && p.isSourceFileFromExternalLibrary(sourceFile);
-      });
+      // const isExternalLibrary = programs.some((p) => {
+      //   const sourceFile = p.getSourceFile(fileName);
+      //   return sourceFile && p.isSourceFileFromExternalLibrary(sourceFile);
+      // });
 
-      if (isExternalLibrary) {
-        if (process.env.DTS_DEBUG) {
-          console.log('[getModule] External library .d.ts file, returning code only');
-          logMemory('getModule external library fast path');
-        }
-        // return { code };
-      }
+      // if (isExternalLibrary) {
+      //   if (process.env.DTS_DEBUG) {
+      //     console.log('[getModule] External library .d.ts file, returning code only');
+      //     logMemory('getModule external library fast path');
+      //   }
+      //   return { code };
+      // }
     }
     if (process.env.DTS_DEBUG) {
       console.log('[getModule] Creating new program for:', fileName.split('/').slice(-3).join('/'));
@@ -120,6 +142,7 @@ function getModule(
     }
     // we created hte program from this fileName, so the source file must exist :P
     const source = newProgram.getSourceFile(fileName)!;
+    moduleResolutionStack.pop();
     return {
       code: source?.getFullText(),
       source,
@@ -130,6 +153,7 @@ function getModule(
       console.log('[getModule] File does not exist, returning null');
     }
     // the file isn't part of an existing program and doesn't exist on disk
+    moduleResolutionStack.pop();
     return null;
   }
 }
