@@ -64,13 +64,6 @@ function getModule(
       program: existingProgram,
     };
   } else if (ts.sys.fileExists(fileName)) {
-    // Check if this is an external library file (from node_modules)
-    // If so, treat it as a .d.ts file without creating a full program.
-    // Creating a TypeScript program for each external file is extremely memory-intensive,
-    // especially for large packages with barrel exports (e.g., type-fest with 170+ files).
-    if (fileName.includes('/node_modules/') || fileName.includes('\\node_modules\\')) {
-      return { code };
-    }
     const newProgram = createProgram(fileName, compilerOptions, tsconfig);
     programs.push(newProgram);
     // we created hte program from this fileName, so the source file must exist :P
