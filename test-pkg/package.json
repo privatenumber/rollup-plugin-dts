@@ -1,7 +1,6 @@
 {
   "scripts": {
-    "build": "rollup -c",
-    "debug": "rollup -c debug-config.mjs"
+    "build": "rm -rf dist; rollup -c"
   },
   "packageManager": "pnpm@10.18.0",
   "devDependencies": {

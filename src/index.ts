@@ -37,15 +37,24 @@ function logMemory(label: string) {
 // Track module resolution to detect cycles
 const moduleResolutionStack: string[] = [];
 const moduleResolutionCount = new Map<string, number>();
+const filesProcessed = new Set<string>();
+let totalGetModuleCalls = 0;
 
 function getModule(
   { entries, programs, resolvedOptions: { compilerOptions, tsconfig } }: DtsPluginContext,
   fileName: string,
   code: string,
 ): ResolvedModule | null {
+  totalGetModuleCalls++;
+
   // Track cycles and repeated calls
   const count = (moduleResolutionCount.get(fileName) || 0) + 1;
   moduleResolutionCount.set(fileName, count);
+
+  const isNewFile = !filesProcessed.has(fileName);
+  if (isNewFile) {
+    filesProcessed.add(fileName);
+  }
 
   if (process.env.DTS_DEBUG) {
     const shortPath = fileName.split('/').slice(-3).join('/');
@@ -59,8 +68,8 @@ function getModule(
       console.log(`\n⚠️  [REPEATED] ${shortPath} (call #${count})`);
     }
 
-    console.log(`[getModule] Processing: ${shortPath}, programs: ${programs.length}, isDTS: ${DTS_EXTENSIONS.test(fileName)}, depth: ${moduleResolutionStack.length}`);
-    logMemory(`getModule start: ${shortPath}`);
+    console.log(`[getModule #${totalGetModuleCalls}] ${isNewFile ? 'NEW' : 'SEEN'} file: ${shortPath}, unique files: ${filesProcessed.size}, programs: ${programs.length}, isDTS: ${DTS_EXTENSIONS.test(fileName)}, depth: ${moduleResolutionStack.length}`);
+    logMemory(`getModule start`);
   }
 
   moduleResolutionStack.push(fileName);
@@ -117,18 +126,19 @@ function getModule(
     // large external packages like type-fest.
     if (programs.length > 0 && DTS_EXTENSIONS.test(fileName)) {
       // Check if this file would be treated as an external library by any existing program
-      // const isExternalLibrary = programs.some((p) => {
-      //   const sourceFile = p.getSourceFile(fileName);
-      //   return sourceFile && p.isSourceFileFromExternalLibrary(sourceFile);
-      // });
+      const isExternalLibrary = programs.some((p) => {
+        const sourceFile = p.getSourceFile(fileName);
+        return sourceFile && p.isSourceFileFromExternalLibrary(sourceFile);
+      });
 
-      // if (isExternalLibrary) {
-      //   if (process.env.DTS_DEBUG) {
-      //     console.log('[getModule] External library .d.ts file, returning code only');
-      //     logMemory('getModule external library fast path');
-      //   }
-      //   return { code };
-      // }
+      if (isExternalLibrary) {
+        if (process.env.DTS_DEBUG) {
+          console.log('[getModule] External library .d.ts file, returning code only');
+          logMemory('getModule external library fast path');
+        }
+        moduleResolutionStack.pop();
+        return { code };
+      }
     }
     if (process.env.DTS_DEBUG) {
       console.log('[getModule] Creating new program for:', fileName.split('/').slice(-3).join('/'));
@@ -137,7 +147,8 @@ function getModule(
     const newProgram = createProgram(fileName, compilerOptions, tsconfig);
     programs.push(newProgram);
     if (process.env.DTS_DEBUG) {
-      console.log(`[getModule] Created new program, total programs: ${programs.length}`);
+      console.log(`[getModule] Created new program #${programs.length} for: ${fileName.split('/').slice(-3).join('/')}`);
+      console.log(`           📊 Stats: ${totalGetModuleCalls} total calls, ${filesProcessed.size} unique files, ${programs.length} programs created`);
       logMemory('getModule after createProgram');
     }
     // we created hte program from this fileName, so the source file must exist :P
