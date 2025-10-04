@@ -40,7 +40,6 @@ function getModule(
   }
 
   const isEntry = entries.includes(fileName);
-
   // Rollup doesn't tell you the entry point of each module in the bundle,
   // so we need to ask every TypeScript program for the given filename.
   const existingProgram = programs.find((p) => {
