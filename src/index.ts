@@ -28,18 +28,37 @@ interface ResolvedModule {
   program?: ts.Program;
 }
 
+function logMemory(label: string) {
+  const mem = process.memoryUsage();
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] [${label}] Heap: ${(mem.heapUsed / 1024 / 1024).toFixed(2)}MB, RSS: ${(mem.rss / 1024 / 1024).toFixed(2)}MB`);
+}
+
 function getModule(
   { entries, programs, resolvedOptions: { compilerOptions, tsconfig } }: DtsPluginContext,
   fileName: string,
   code: string,
 ): ResolvedModule | null {
+  if (process.env.DTS_DEBUG) {
+    const shortPath = fileName.split('/').slice(-3).join('/');
+    console.log(`[getModule] Processing: ${shortPath}, programs: ${programs.length}, isDTS: ${DTS_EXTENSIONS.test(fileName)}`);
+    logMemory(`getModule start: ${shortPath}`);
+  }
+
   // Create any `ts.SourceFile` objects on-demand for ".d.ts" modules,
   // but only when there are zero ".ts" entry points.
   if (!programs.length && DTS_EXTENSIONS.test(fileName)) {
+    if (process.env.DTS_DEBUG) {
+      console.log('[getModule] Fast path: no programs, returning code only');
+    }
     return { code };
   }
 
   const isEntry = entries.includes(fileName);
+  if (process.env.DTS_DEBUG) {
+    console.log(`[getModule] isEntry: ${isEntry}, entries: ${entries.length}`);
+  }
+
   // Rollup doesn't tell you the entry point of each module in the bundle,
   // so we need to ask every TypeScript program for the given filename.
   const existingProgram = programs.find((p) => {
@@ -50,12 +69,19 @@ function getModule(
     } else {
       const sourceFile = p.getSourceFile(fileName);
       if (sourceFile && p.isSourceFileFromExternalLibrary(sourceFile)) {
+        if (process.env.DTS_DEBUG) {
+          console.log(`[getModule] Found in program but is external library, skipping`);
+        }
         return false;
       }
       return !!sourceFile;
     }
   });
   if (existingProgram) {
+    if (process.env.DTS_DEBUG) {
+      console.log('[getModule] Found existing program');
+      logMemory('getModule existing program');
+    }
     // we know this exists b/c of the .filter above, so this non-null assertion is safe
     const source = existingProgram.getSourceFile(fileName)!;
     return {
@@ -64,8 +90,34 @@ function getModule(
       program: existingProgram,
     };
   } else if (ts.sys.fileExists(fileName)) {
+    // For .d.ts files from external libraries (when programs exist), just return the code
+    // without creating a new program. This avoids creating hundreds of programs for
+    // large external packages like type-fest.
+    if (programs.length > 0 && DTS_EXTENSIONS.test(fileName)) {
+      // Check if this file would be treated as an external library by any existing program
+      const isExternalLibrary = programs.some((p) => {
+        const sourceFile = p.getSourceFile(fileName);
+        return sourceFile && p.isSourceFileFromExternalLibrary(sourceFile);
+      });
+
+      if (isExternalLibrary) {
+        if (process.env.DTS_DEBUG) {
+          console.log('[getModule] External library .d.ts file, returning code only');
+          logMemory('getModule external library fast path');
+        }
+        // return { code };
+      }
+    }
+    if (process.env.DTS_DEBUG) {
+      console.log('[getModule] Creating new program for:', fileName.split('/').slice(-3).join('/'));
+      logMemory('getModule before createProgram');
+    }
     const newProgram = createProgram(fileName, compilerOptions, tsconfig);
     programs.push(newProgram);
+    if (process.env.DTS_DEBUG) {
+      console.log(`[getModule] Created new program, total programs: ${programs.length}`);
+      logMemory('getModule after createProgram');
+    }
     // we created hte program from this fileName, so the source file must exist :P
     const source = newProgram.getSourceFile(fileName)!;
     return {
@@ -74,6 +126,9 @@ function getModule(
       program: newProgram,
     };
   } else {
+    if (process.env.DTS_DEBUG) {
+      console.log('[getModule] File does not exist, returning null');
+    }
     // the file isn't part of an existing program and doesn't exist on disk
     return null;
   }
@@ -119,7 +174,16 @@ const plugin: PluginImpl<Options> = (options = {}) => {
     },
 
     transform(code, id) {
+      if (process.env.DTS_DEBUG) {
+        const shortId = id.split('/').slice(-3).join('/');
+        console.log(`\n[transform] Starting transform for: ${shortId}`);
+        logMemory('transform start');
+      }
+
       if (!TS_EXTENSIONS.test(id) && !JSON_EXTENSIONS.test(id)) {
+        if (process.env.DTS_DEBUG) {
+          console.log('[transform] Skipping non-TS/JSON file');
+        }
         return null;
       }
 
@@ -183,15 +247,47 @@ const plugin: PluginImpl<Options> = (options = {}) => {
       };
 
       // if it's a .d.ts file, handle it as-is
-      if (DTS_EXTENSIONS.test(id)) return handleDtsFile();
+      if (DTS_EXTENSIONS.test(id)) {
+        if (process.env.DTS_DEBUG) {
+          console.log('[transform] Handling as .d.ts file');
+        }
+        const result = handleDtsFile();
+        if (process.env.DTS_DEBUG) {
+          logMemory('transform after handleDtsFile');
+        }
+        return result;
+      }
 
       // if it's a json file, use the typescript compiler to generate the declarations,
       // requires `compilerOptions.resolveJsonModule: true`.
       // This is also commonly used with `@rollup/plugin-json` to import JSON files.
-      if (JSON_EXTENSIONS.test(id)) return generateDts();
+      if (JSON_EXTENSIONS.test(id)) {
+        if (process.env.DTS_DEBUG) {
+          console.log('[transform] Handling as JSON file');
+        }
+        const result = generateDts();
+        if (process.env.DTS_DEBUG) {
+          logMemory('transform after generateDts (JSON)');
+        }
+        return result;
+      }
 
       // first attempt to treat .ts files as .d.ts files, and otherwise use the typescript compiler to generate the declarations
-      return treatTsAsDts() ?? generateDts();
+      if (process.env.DTS_DEBUG) {
+        console.log('[transform] Treating .ts as .d.ts or generating');
+      }
+      const treated = treatTsAsDts();
+      if (process.env.DTS_DEBUG) {
+        logMemory('transform after treatTsAsDts');
+        if (!treated) {
+          console.log('[transform] treatTsAsDts returned null, calling generateDts');
+        }
+      }
+      const result = treated ?? generateDts();
+      if (process.env.DTS_DEBUG) {
+        logMemory('transform end');
+      }
+      return result;
     },
 
     resolveId(source, importer) {
