@@ -26,13 +26,6 @@ import MagicString from "magic-string";
  *    the postprocess convert any javascript code that was created for namespace
  *    exports into TypeScript namespaces. See `NamespaceFixer.ts`.
  */
-
-function logMemory(label: string) {
-  const mem = process.memoryUsage();
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] [TRANSFORM ${label}] Heap: ${(mem.heapUsed / 1024 / 1024).toFixed(2)}MB, RSS: ${(mem.rss / 1024 / 1024).toFixed(2)}MB`);
-}
-
 export const transform = () => {
   const allTypeReferences = new Map<string, Set<string>>();
   const allFileReferences = new Map<string, Set<string>>();
@@ -77,12 +70,6 @@ export const transform = () => {
     },
 
     transform(code, fileName) {
-      if (process.env.DTS_DEBUG) {
-        const shortPath = fileName.split('/').slice(-3).join('/');
-        console.log(`\n[TRANSFORM-PLUGIN] Starting: ${shortPath}`);
-        logMemory('start');
-      }
-
       // `fileName` may not match the name in the moduleIds,
       // as we generate the `fileName` manually in the previews step,
       // so we need to find the correct moduleId.
@@ -92,21 +79,8 @@ export const transform = () => {
       const isEntry = Boolean(moduleId && this.getModuleInfo(moduleId)?.isEntry);
       const isJSON = Boolean(moduleId && JSON_EXTENSIONS.test(moduleId));
 
-      if (process.env.DTS_DEBUG) {
-        console.log(`[TRANSFORM-PLUGIN] isEntry: ${isEntry}, isJSON: ${isJSON}`);
-        logMemory('before parse');
-      }
-
       let sourceFile = parse(fileName, code);
-      if (process.env.DTS_DEBUG) {
-        logMemory('after parse');
-      }
-
       const preprocessed = preProcess({ sourceFile, isEntry, isJSON });
-      if (process.env.DTS_DEBUG) {
-        logMemory('after preProcess');
-      }
-
       // `sourceFile.fileName` here uses forward slashes
       allTypeReferences.set(sourceFile.fileName, preprocessed.typeReferences);
       allFileReferences.set(sourceFile.fileName, preprocessed.fileReferences);
@@ -114,14 +88,7 @@ export const transform = () => {
       code = preprocessed.code.toString();
 
       sourceFile = parse(fileName, code);
-      if (process.env.DTS_DEBUG) {
-        logMemory('after second parse');
-      }
-
       const converted = convert({ sourceFile });
-      if (process.env.DTS_DEBUG) {
-        logMemory('after convert');
-      }
 
       if (process.env.DTS_DUMP_AST) {
         console.log(fileName);
