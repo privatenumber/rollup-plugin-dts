@@ -1,0 +1,13 @@
+{
+  "scripts": {
+    "build": "rollup -c",
+    "debug": "rollup -c debug-config.mjs"
+  },
+  "packageManager": "pnpm@10.18.0",
+  "devDependencies": {
+    "rollup": "^4.52.4",
+    "rollup-plugin-dts": "link:..",
+    "type-fest": "^5.0.1",
+    "typescript": "^5.9.3"
+  }
+}
