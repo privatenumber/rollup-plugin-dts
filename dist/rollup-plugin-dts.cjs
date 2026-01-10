@@ -2300,7 +2300,11 @@ const transform = () => {
                 let newNames;
                 if (canSimplyReplace && singleInputMap) {
                     // Simple replacement: keep transform's mappings, just swap the source
-                    newSources = singleInputMap.sources.map((source) => path__namespace.isAbsolute(source) ? path__namespace.relative(outputDir, source) : source);
+                    newSources = singleInputMap.sources.map((source) => {
+                        const relative = path__namespace.isAbsolute(source) ? path__namespace.relative(outputDir, source) : source;
+                        // Normalize to forward slashes for sourcemaps (URLs)
+                        return relative.replaceAll("\\", "/");
+                    });
                     newSourcesContent = singleInputMap.sourcesContent || [null];
                     newMappings = chunk.map.mappings;
                     newNames = chunk.map.names || [];
@@ -2319,10 +2323,9 @@ const transform = () => {
                         .map((source) => {
                         if (!source)
                             return source;
-                        if (path__namespace.isAbsolute(source)) {
-                            return path__namespace.relative(outputDir, source);
-                        }
-                        return source;
+                        const relative = path__namespace.isAbsolute(source) ? path__namespace.relative(outputDir, source) : source;
+                        // Normalize to forward slashes for sourcemaps (URLs)
+                        return relative.replaceAll("\\", "/");
                     })
                         .filter((s) => s !== null);
                     newSourcesContent = (remapped.sourcesContent || []);
