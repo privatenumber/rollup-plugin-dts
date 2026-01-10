@@ -2275,6 +2275,33 @@ const transform = () => {
             for (const chunk of Object.values(bundle)) {
                 if (chunk.type !== "chunk" || !chunk.map)
                     continue;
+                // Handle empty sourcemaps (empty chunks like "export {};")
+                // Rollup generates empty sources for these, but we want to preserve original references
+                if (chunk.map.sources.length === 0 && chunk.facadeModuleId) {
+                    const inputMap = inputSourcemaps.get(chunk.facadeModuleId);
+                    if (inputMap && inputMap.sources.length > 0) {
+                        const newSources = inputMap.sources.map((source) => {
+                            const relative = path__namespace.isAbsolute(source) ? path__namespace.relative(outputDir, source) : source;
+                            return relative.replaceAll("\\", "/");
+                        });
+                        chunk.map.sources = newSources;
+                        chunk.map.sourcesContent = inputMap.sourcesContent || [];
+                        // Also update the sourcemap asset
+                        const mapFileName = `${chunk.fileName}.map`;
+                        const mapAsset = bundle[mapFileName];
+                        if (mapAsset && mapAsset.type === "asset") {
+                            mapAsset.source = JSON.stringify({
+                                version: 3,
+                                file: chunk.fileName,
+                                sources: newSources,
+                                sourcesContent: inputMap.sourcesContent || [],
+                                mappings: chunk.map.mappings,
+                                names: chunk.map.names || [],
+                            });
+                        }
+                    }
+                    continue;
+                }
                 // Check if any sources have input sourcemaps that need to be composed
                 const sourcesToRemap = new Map();
                 for (const source of chunk.map.sources) {
