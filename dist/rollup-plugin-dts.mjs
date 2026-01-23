@@ -2317,8 +2317,26 @@ const transform = () => {
                         sourcesToRemap.set(absoluteSource, inputMap);
                     }
                 }
-                if (sourcesToRemap.size === 0)
+                if (sourcesToRemap.size === 0) {
+                    // Handle empty chunks (like "export {};") - Rollup produces empty sources
+                    // but we want to preserve original source references from input map
+                    if (chunk.map.sources.length === 0 && chunk.facadeModuleId) {
+                        const inputMap = inputSourcemaps.get(chunk.facadeModuleId);
+                        if (inputMap && inputMap.sources.length > 0) {
+                            const newSources = inputMap.sources.map(toRelativeSourcePath);
+                            const newSourcesContent = inputMap.sourcesContent || [];
+                            chunk.map.sources = newSources;
+                            chunk.map.sourcesContent = newSourcesContent;
+                            updateSourcemapAsset(bundle, chunk.fileName, {
+                                sources: newSources,
+                                sourcesContent: newSourcesContent,
+                                mappings: chunk.map.mappings,
+                                names: chunk.map.names || [],
+                            });
+                        }
+                    }
                     continue;
+                }
                 // For single-source cases where the input sourcemap also has a single source,
                 // just replace the source directly to preserve the transform's hires mappings
                 // This is important for Go-to-Definition to work line-by-line
@@ -2357,19 +2375,12 @@ const transform = () => {
                 chunk.map.sourcesContent = newSourcesContent;
                 chunk.map.mappings = newMappings;
                 chunk.map.names = newNames;
-                // Also update the sourcemap asset
-                const mapFileName = `${chunk.fileName}.map`;
-                const mapAsset = bundle[mapFileName];
-                if (mapAsset && mapAsset.type === "asset") {
-                    mapAsset.source = JSON.stringify({
-                        version: 3,
-                        file: chunk.fileName,
-                        sources: newSources,
-                        sourcesContent: newSourcesContent,
-                        mappings: newMappings,
-                        names: newNames,
-                    });
-                }
+                updateSourcemapAsset(bundle, chunk.fileName, {
+                    sources: newSources,
+                    sourcesContent: newSourcesContent,
+                    mappings: newMappings,
+                    names: newNames,
+                });
             }
         },
     };
@@ -2379,6 +2390,17 @@ function writeBlock(codes) {
         return codes.join("\n") + "\n";
     }
     return "";
+}
+function updateSourcemapAsset(bundle, chunkFileName, data) {
+    const mapFileName = `${chunkFileName}.map`;
+    const mapAsset = bundle[mapFileName];
+    if (mapAsset && mapAsset.type === "asset") {
+        mapAsset.source = JSON.stringify({
+            version: 3,
+            file: chunkFileName,
+            ...data,
+        });
+    }
 }
 
 const TS_EXTENSIONS = /\.([cm]ts|[tj]sx?)$/;
