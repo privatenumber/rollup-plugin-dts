@@ -2322,20 +2322,23 @@ const transform = () => {
                 }
             }
             const outputDir = options.dir || (options.file ? path__namespace.dirname(options.file) : process.cwd());
-            // Normalize path to relative forward-slash format for sourcemaps
-            const toRelativeSourcePath = (source) => {
-                const relative = path__namespace.isAbsolute(source) ? path__namespace.relative(outputDir, source) : source;
-                return relative.replaceAll("\\", "/");
-            };
             for (const chunk of Object.values(bundle)) {
                 if (chunk.type !== "chunk" || !chunk.map)
                     continue;
                 // Check if any sources have input sourcemaps that need to be composed
+                // Sources in chunk.map are relative to the chunk's output location, not the outputDir
+                const chunkDir = path__namespace.join(outputDir, path__namespace.dirname(chunk.fileName));
+                // Normalize path to relative forward-slash format for sourcemaps
+                // Must be relative to chunkDir since sourcemap paths are relative to the .map file location
+                const toRelativeSourcePath = (source) => {
+                    const relative = path__namespace.isAbsolute(source) ? path__namespace.relative(chunkDir, source) : source;
+                    return relative.replaceAll("\\", "/");
+                };
                 const sourcesToRemap = new Map();
                 for (const source of chunk.map.sources) {
                     if (!source)
                         continue;
-                    const absoluteSource = path__namespace.resolve(outputDir, source);
+                    const absoluteSource = path__namespace.resolve(chunkDir, source);
                     const inputMap = inputSourcemaps.get(absoluteSource);
                     if (inputMap) {
                         sourcesToRemap.set(absoluteSource, inputMap);
@@ -2381,7 +2384,8 @@ const transform = () => {
                 }
                 else {
                     const remapped = remapping(chunk.map, (file) => {
-                        const absolutePath = path__namespace.resolve(outputDir, file);
+                        // File paths from remapping are relative to the chunk's output location
+                        const absolutePath = path__namespace.resolve(chunkDir, file);
                         const inputMap = sourcesToRemap.get(absolutePath);
                         if (inputMap) {
                             return inputMap;
