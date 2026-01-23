@@ -8,6 +8,8 @@ var remapping = require('@jridgewell/remapping');
 var node_module = require('node:module');
 var MagicString = require('magic-string');
 var fs = require('node:fs/promises');
+var sourcemapCodec = require('@jridgewell/sourcemap-codec');
+var convert$1 = require('convert-source-map');
 
 var _documentCurrentScript = typeof document !== 'undefined' ? document.currentScript : null;
 function _interopNamespaceDefault(e) {
@@ -2058,49 +2060,99 @@ class RelativeModuleDeclarationFixer {
     }
 }
 
-// Load sourcemap from external file, inline data URL, or file reference
+/**
+ * Hydrate sparse sourcemap with detailed segments from input map.
+ *
+ * Rollup's output map has sparse mappings (few segments per line).
+ * The input .d.ts.map has detailed mappings (per-identifier).
+ * This function uses Rollup's sparse map as "anchors" to find which
+ * source line each output line came from, then fills in detailed
+ * segments from the input map.
+ *
+ * This enables Go-to-Definition to work for individual identifiers,
+ * not just line starts.
+ */
+function hydrateSourcemap(sparseMappings, inputMap, outputCode) {
+    const sparseDecoded = sourcemapCodec.decode(sparseMappings);
+    const inputDecoded = sourcemapCodec.decode(inputMap.mappings);
+    const outputLines = outputCode.split("\n");
+    const hydratedMappings = [];
+    for (let outLine = 0; outLine < sparseDecoded.length; outLine += 1) {
+        const sparseSegments = sparseDecoded[outLine];
+        if (!sparseSegments || sparseSegments.length === 0) {
+            hydratedMappings.push([]);
+            continue;
+        }
+        // Use first segment as anchor to find source line
+        const anchor = sparseSegments[0];
+        if (!anchor || anchor.length < 4) {
+            hydratedMappings.push(sparseSegments);
+            continue;
+        }
+        const [, srcIdx, srcLine] = anchor;
+        if (srcIdx !== 0 || srcLine === undefined || srcLine < 0 || srcLine >= inputDecoded.length) {
+            hydratedMappings.push(sparseSegments);
+            continue;
+        }
+        const inputSegments = inputDecoded[srcLine];
+        if (!inputSegments || inputSegments.length === 0) {
+            hydratedMappings.push(sparseSegments);
+            continue;
+        }
+        const anchorOutCol = anchor[0];
+        const anchorSrcCol = anchor.length >= 4 ? anchor[3] : 0;
+        const delta = anchorOutCol - (anchorSrcCol ?? 0);
+        const outputLine = outputLines[outLine] || "";
+        const hydratedSegments = [];
+        for (const seg of inputSegments) {
+            const adjustedCol = seg[0] + delta;
+            // Sanity check: skip segments outside valid range
+            if (adjustedCol < 0 || adjustedCol > outputLine.length)
+                continue;
+            if (seg.length === 5) {
+                hydratedSegments.push([adjustedCol, seg[1], seg[2], seg[3], seg[4]]);
+            }
+            else if (seg.length === 4) {
+                hydratedSegments.push([adjustedCol, seg[1], seg[2], seg[3]]);
+            }
+            else {
+                hydratedSegments.push([adjustedCol]);
+            }
+        }
+        // Sort by column (required by sourcemap spec)
+        hydratedSegments.sort((a, b) => a[0] - b[0]);
+        hydratedMappings.push(hydratedSegments);
+    }
+    return sourcemapCodec.encode(hydratedMappings);
+}
+// Load sourcemap from inline data URL, file reference, or external .map file
 async function loadInputSourcemap(info) {
-    const { fileName, sourceMappingUrl } = info;
-    // Try external .map file first (when no sourceMappingURL comment)
-    if (!sourceMappingUrl) {
-        const inputMapPath = fileName + ".map";
-        try {
-            const inputMapContent = await fs.readFile(inputMapPath, "utf8");
-            return JSON.parse(inputMapContent);
-        }
-        catch {
-            return null;
-        }
+    const { fileName, originalCode } = info;
+    // Try inline sourcemap (base64 or url-encoded data URL)
+    const inlineConverter = convert$1.fromSource(originalCode);
+    if (inlineConverter) {
+        return inlineConverter.toObject();
     }
-    // File reference (not a data URL)
-    if (!sourceMappingUrl.startsWith("data:")) {
-        try {
-            // Strip query string if present (e.g., "index.d.ts.map?v=12345" -> "index.d.ts.map")
-            const urlWithoutQuery = sourceMappingUrl.split("?")[0];
-            const mapFilePath = path__namespace.resolve(path__namespace.dirname(fileName), urlWithoutQuery);
-            const mapContent = await fs.readFile(mapFilePath, "utf8");
-            return JSON.parse(mapContent);
-        }
-        catch {
-            return null;
-        }
-    }
-    // Parse data URL (inline sourcemap)
-    const dataUrlRegex = /^data:([^;,]*)(;[^,]*)?,(.*)$/;
-    const dataMatch = dataUrlRegex.exec(sourceMappingUrl);
-    if (!dataMatch)
-        return null;
-    const params = dataMatch[2] || "";
-    const data = dataMatch[3];
+    // Try file reference (//# sourceMappingURL=foo.map)
+    const readMap = async (mapFile) => {
+        // Strip query string or fragment if present (e.g., "index.d.ts.map?v=12345" or "index.d.ts.map#hash")
+        const urlWithoutQuery = mapFile.split(/[?#]/)[0];
+        const mapFilePath = path__namespace.resolve(path__namespace.dirname(fileName), urlWithoutQuery);
+        return fs.readFile(mapFilePath, "utf8");
+    };
     try {
-        if (params.includes("base64")) {
-            const decoded = Buffer.from(data, "base64").toString("utf8");
-            return JSON.parse(decoded);
+        const fileConverter = await convert$1.fromMapFileSource(originalCode, readMap);
+        if (fileConverter) {
+            return fileConverter.toObject();
         }
-        else {
-            const decoded = decodeURIComponent(data);
-            return JSON.parse(decoded);
-        }
+    }
+    catch {
+        // File not found or parse error, try external .map
+    }
+    // Try external .map file (no comment in source)
+    try {
+        const mapContent = await fs.readFile(fileName + ".map", "utf8");
+        return JSON.parse(mapContent);
     }
     catch {
         return null;
@@ -2199,11 +2251,9 @@ const transform = () => {
             const map = preprocessed.code.generateMap({ hires: true, source: fileName });
             // Store info for lazy sourcemap loading in generateBundle (avoids file I/O if sourcemaps disabled)
             if (DTS_EXTENSIONS.test(fileName)) {
-                const sourceMapCommentRegex = /\/\/[#@]\s*sourceMappingURL\s*=\s*(\S+)\s*$/m;
-                const match = sourceMapCommentRegex.exec(code);
                 pendingSourcemaps.set(fileName, {
                     fileName,
-                    sourceMappingUrl: match ? match[1] : null,
+                    originalCode: code,
                 });
             }
             return { code, ast: converted.ast, map: map };
@@ -2263,7 +2313,7 @@ const transform = () => {
                 if (inputMap && inputMap.sources) {
                     const inputMapDir = path__namespace.dirname(fileName);
                     inputSourcemaps.set(fileName, {
-                        version: inputMap.version || 3,
+                        version: inputMap.version ?? 3,
                         sources: inputMap.sources.map((source) => path__namespace.isAbsolute(source) ? source : path__namespace.resolve(inputMapDir, source)),
                         sourcesContent: inputMap.sourcesContent,
                         mappings: inputMap.mappings,
@@ -2272,36 +2322,14 @@ const transform = () => {
                 }
             }
             const outputDir = options.dir || (options.file ? path__namespace.dirname(options.file) : process.cwd());
+            // Normalize path to relative forward-slash format for sourcemaps
+            const toRelativeSourcePath = (source) => {
+                const relative = path__namespace.isAbsolute(source) ? path__namespace.relative(outputDir, source) : source;
+                return relative.replaceAll("\\", "/");
+            };
             for (const chunk of Object.values(bundle)) {
                 if (chunk.type !== "chunk" || !chunk.map)
                     continue;
-                // Handle empty sourcemaps (empty chunks like "export {};")
-                // Rollup generates empty sources for these, but we want to preserve original references
-                if (chunk.map.sources.length === 0 && chunk.facadeModuleId) {
-                    const inputMap = inputSourcemaps.get(chunk.facadeModuleId);
-                    if (inputMap && inputMap.sources.length > 0) {
-                        const newSources = inputMap.sources.map((source) => {
-                            const relative = path__namespace.isAbsolute(source) ? path__namespace.relative(outputDir, source) : source;
-                            return relative.replaceAll("\\", "/");
-                        });
-                        chunk.map.sources = newSources;
-                        chunk.map.sourcesContent = inputMap.sourcesContent || [];
-                        // Also update the sourcemap asset
-                        const mapFileName = `${chunk.fileName}.map`;
-                        const mapAsset = bundle[mapFileName];
-                        if (mapAsset && mapAsset.type === "asset") {
-                            mapAsset.source = JSON.stringify({
-                                version: 3,
-                                file: chunk.fileName,
-                                sources: newSources,
-                                sourcesContent: inputMap.sourcesContent || [],
-                                mappings: chunk.map.mappings,
-                                names: chunk.map.names || [],
-                            });
-                        }
-                    }
-                    continue;
-                }
                 // Check if any sources have input sourcemaps that need to be composed
                 const sourcesToRemap = new Map();
                 for (const source of chunk.map.sources) {
@@ -2326,18 +2354,14 @@ const transform = () => {
                 let newMappings;
                 let newNames;
                 if (canSimplyReplace && singleInputMap) {
-                    // Simple replacement: keep transform's mappings, just swap the source
-                    newSources = singleInputMap.sources.map((source) => {
-                        const relative = path__namespace.isAbsolute(source) ? path__namespace.relative(outputDir, source) : source;
-                        // Normalize to forward slashes for sourcemaps (URLs)
-                        return relative.replaceAll("\\", "/");
-                    });
+                    // Sparse-Anchor Hydration: use Rollup's sparse map as anchors,
+                    // then fill in detailed segments from the input map
+                    newSources = singleInputMap.sources.map(toRelativeSourcePath);
                     newSourcesContent = singleInputMap.sourcesContent || [null];
-                    newMappings = chunk.map.mappings;
-                    newNames = chunk.map.names || [];
+                    newMappings = hydrateSourcemap(chunk.map.mappings, singleInputMap, chunk.code);
+                    newNames = singleInputMap.names || [];
                 }
                 else {
-                    // Multi-source case: use remapping to compose the sourcemaps
                     const remapped = remapping(chunk.map, (file) => {
                         const absolutePath = path__namespace.resolve(outputDir, file);
                         const inputMap = sourcesToRemap.get(absolutePath);
@@ -2347,19 +2371,12 @@ const transform = () => {
                         return null;
                     });
                     newSources = remapped.sources
-                        .map((source) => {
-                        if (!source)
-                            return source;
-                        const relative = path__namespace.isAbsolute(source) ? path__namespace.relative(outputDir, source) : source;
-                        // Normalize to forward slashes for sourcemaps (URLs)
-                        return relative.replaceAll("\\", "/");
-                    })
-                        .filter((s) => s !== null);
+                        .filter((s) => s !== null)
+                        .map(toRelativeSourcePath);
                     newSourcesContent = (remapped.sourcesContent || []);
                     newMappings = typeof remapped.mappings === "string" ? remapped.mappings : "";
                     newNames = remapped.names || [];
                 }
-                // Update chunk.map
                 chunk.map.sources = newSources;
                 chunk.map.sourcesContent = newSourcesContent;
                 chunk.map.mappings = newMappings;
