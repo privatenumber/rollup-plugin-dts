@@ -35,6 +35,14 @@
   "files": [
     "dist"
   ],
+  "scripts": {
+    "clean": "node -e \"(async () => { try { await require('fs/promises').rm('dist', { recursive: true }); } catch {} })()\"",
+    "prebuild": "npm run clean",
+    "build": "tsc && rollup --config .build/rollup.config.js",
+    "prepublishOnly": "npm run test",
+    "pretest": "npm run build",
+    "test": "c8 node .build/tests/index.js"
+  },
   "prettier": {
     "printWidth": 120,
     "trailingComma": "all"
@@ -64,12 +72,5 @@
     "@jridgewell/sourcemap-codec": "^1.5.5",
     "convert-source-map": "^2.0.0",
     "magic-string": "^0.30.21"
-  },
-  "scripts": {
-    "clean": "node -e \"(async () => { try { await require('fs/promises').rm('dist', { recursive: true }); } catch {} })()\"",
-    "prebuild": "npm run clean",
-    "build": "tsc && rollup --config .build/rollup.config.js",
-    "pretest": "npm run build",
-    "test": "c8 node .build/tests/index.js"
   }
 }
