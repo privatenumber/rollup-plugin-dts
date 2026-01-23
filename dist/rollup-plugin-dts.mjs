@@ -2401,7 +2401,8 @@ function updateSourcemapAsset(bundle, chunkFileName, data) {
     if (mapAsset && mapAsset.type === "asset") {
         mapAsset.source = JSON.stringify({
             version: 3,
-            file: chunkFileName,
+            // file should be just the basename since the .map is in the same directory
+            file: path.basename(chunkFileName),
             ...data,
         });
     }
