@@ -2431,9 +2431,20 @@ const transform = (enableSourcemap) => {
                     newNames = singleInputMap.names || [];
                 }
                 else {
+                    // Track visited files to prevent infinite recursion.
+                    // When TypeScript compiles foo.ts → foo.d.ts + foo.d.ts.map, the map's sources
+                    // point back to foo.ts. If we return the same map when resolving foo.ts,
+                    // @jridgewell/remapping will recursively try to resolve foo.ts again → infinite loop.
+                    const visitedFiles = new Set();
                     const remapped = remapping(chunk.map, (file) => {
                         // File paths from remapping are relative to the chunk's output location
                         const absolutePath = path.resolve(chunkDir, file);
+                        // Prevent infinite recursion: if we've already returned a map for this file,
+                        // return null to stop the chain (this file is the original source)
+                        if (visitedFiles.has(absolutePath)) {
+                            return null;
+                        }
+                        visitedFiles.add(absolutePath);
                         const inputMap = sourcesToRemap.get(absolutePath);
                         if (inputMap) {
                             return inputMap;
