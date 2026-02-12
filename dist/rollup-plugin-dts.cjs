@@ -297,16 +297,8 @@ class NamespaceFixer {
             }
             // Remove redundant `{ Foo as Foo }` exports from a namespace which we
             // added in pre-processing to fix up broken renaming
-            if (ts.isModuleDeclaration(node) && node.body) {
-                let body = node.body;
-                // Traverse dotted namespace chain (e.g. `namespace A.B.C {}`)
-                while (ts.isModuleDeclaration(body) && body.body) {
-                    body = body.body;
-                }
-                if (!ts.isModuleBlock(body)) {
-                    continue;
-                }
-                for (const stmt of body.statements) {
+            if (ts.isModuleDeclaration(node) && node.body && ts.isModuleBlock(node.body)) {
+                for (const stmt of node.body.statements) {
                     if (ts.isExportDeclaration(stmt) && stmt.exportClause) {
                         if (ts.isNamespaceExport(stmt.exportClause)) {
                             continue;
@@ -896,18 +888,11 @@ function getNodeIndent(node) {
 }
 
 function preProcessNamespaceBody(body, code, sourceFile) {
-    // Recurse through dotted namespace chain (e.g. `namespace A.B.C {}`)
-    if (ts.isModuleDeclaration(body)) {
-        if (body.body && (ts.isModuleBlock(body.body) || ts.isModuleDeclaration(body.body))) {
-            preProcessNamespaceBody(body.body, code);
-        }
-        return;
-    }
     for (const stmt of body.statements) {
         // Safely call the new context-aware function on all children
         fixModifiers(code, stmt);
         // Recurse for nested namespaces
-        if (ts.isModuleDeclaration(stmt) && stmt.body && (ts.isModuleBlock(stmt.body) || ts.isModuleDeclaration(stmt.body))) {
+        if (ts.isModuleDeclaration(stmt) && stmt.body && ts.isModuleBlock(stmt.body)) {
             preProcessNamespaceBody(stmt.body, code);
         }
     }
@@ -1000,7 +985,7 @@ function preProcess({ sourceFile, isEntry, isJSON }) {
             }
             // duplicate exports of namespaces
             if (ts.isModuleDeclaration(node)) {
-                if (node.body && (ts.isModuleBlock(node.body) || ts.isModuleDeclaration(node.body))) {
+                if (node.body && ts.isModuleBlock(node.body)) {
                     preProcessNamespaceBody(node.body, code);
                 }
                 duplicateExports(code, node);
@@ -1188,6 +1173,29 @@ function preProcess({ sourceFile, isEntry, isJSON }) {
         }
         code.remove(start, end);
     }
+    // Strip trailing sourceMappingURL comments so they don't leak into bundled output
+    const fullText = sourceFile.getFullText();
+    // Check EOF token's leading trivia (comment on its own line after last statement)
+    // and last statement's trailing trivia (comment on same line as last statement)
+    const eofTrivia = ts.getLeadingCommentRanges(fullText, sourceFile.endOfFileToken.getFullStart());
+    const lastStatement = sourceFile.statements[sourceFile.statements.length - 1];
+    const trailingTrivia = lastStatement
+        ? ts.getTrailingCommentRanges(fullText, lastStatement.getEnd())
+        : undefined;
+    for (const comment of [...(eofTrivia ?? []), ...(trailingTrivia ?? [])]) {
+        // Skip block comments — sourceMappingURL text inside /** */ must not be stripped
+        if (comment.kind !== ts.SyntaxKind.SingleLineCommentTrivia)
+            continue;
+        const text = fullText.slice(comment.pos, comment.end);
+        if (!/\/\/[#@]\s*sourceMappingURL=/.test(text))
+            continue;
+        let start = comment.pos;
+        if (start > 0 && fullText[start - 1] === "\n") {
+            start -= 1;
+        }
+        code.remove(start, comment.end);
+        break;
+    }
     return {
         code,
         typeReferences,
@@ -1299,15 +1307,7 @@ function fixModifiers(code, node) {
     // For statements inside namespaces, preserve all modifiers (including export)
 }
 function duplicateExports(code, module) {
-    if (!module.body) {
-        return;
-    }
-    // Recurse through dotted namespace chain
-    if (ts.isModuleDeclaration(module.body)) {
-        duplicateExports(code, module.body);
-        return;
-    }
-    if (!ts.isModuleBlock(module.body)) {
+    if (!module.body || !ts.isModuleBlock(module.body)) {
         return;
     }
     for (const node of module.body.statements) {
@@ -1858,7 +1858,7 @@ class Transformer {
         }
         const scope = this.createDeclaration(node, node.name);
         scope.pushIdentifierReference(node.name);
-        scope.convertNamespace(node, true);
+        scope.convertNamespace(node);
     }
     convertEnumDeclaration(node) {
         const scope = this.createDeclaration(node, node.name);
@@ -2279,6 +2279,8 @@ const transform = (enableSourcemap) => {
             const moduleId = Array.from(moduleIds).find((id) => trimExtension(id) === name);
             const isEntry = Boolean(moduleId && this.getModuleInfo(moduleId)?.isEntry);
             const isJSON = Boolean(moduleId && JSON_EXTENSIONS.test(moduleId));
+            // Preserve original code for loadInputSourcemap() before preProcess strips sourceMappingURL
+            const rawCode = code;
             let sourceFile = parse(fileName, code);
             const preprocessed = preProcess({ sourceFile, isEntry, isJSON });
             // `sourceFile.fileName` here uses forward slashes
@@ -2304,7 +2306,7 @@ const transform = (enableSourcemap) => {
             if (DTS_EXTENSIONS.test(fileName)) {
                 pendingSourcemaps.set(fileName, {
                     fileName,
-                    originalCode: code,
+                    originalCode: rawCode,
                     inputMapText,
                 });
             }
