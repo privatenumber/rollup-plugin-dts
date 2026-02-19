@@ -987,7 +987,9 @@ function preProcess({ sourceFile, isEntry, isJSON }) {
                 const name = node.name.getText();
                 declaredNames.add(name);
                 // collect the exported name, maybe as `default`.
-                if (matchesModifier(node, ts.ModifierFlags.ExportDefault)) {
+                // `declare global` blocks are global augmentations, not actual exports.
+                if (node.flags & ts.NodeFlags.GlobalAugmentation) ;
+                else if (matchesModifier(node, ts.ModifierFlags.ExportDefault)) {
                     defaultExport = name;
                 }
                 else if ((treatAsGlobalModule && ts.isIdentifier(node.name))
