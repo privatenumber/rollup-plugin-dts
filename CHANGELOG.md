@@ -1,5 +1,17 @@
 # Changelog
 
+## 6.4.1
+
+**Fixes**:
+
+- Fixed regression related to new SourceMap handling
+
+**Thank you**:
+
+Features, fixes and improvements in this release have been contributed by:
+
+- [@privatenumber](https://github.com/privatenumber)
+
 ## 6.4.0
 
 **Features**:
