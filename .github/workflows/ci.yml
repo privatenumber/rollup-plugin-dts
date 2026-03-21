@@ -6,7 +6,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [16, 24]
+        node: [20, latest]
         os: [ubuntu-latest, windows-latest]
 
     name: Node ${{ matrix.node }} on ${{ matrix.os }}
@@ -24,14 +24,16 @@ jobs:
       # frequently hangs for whatever reason,
       # and we have no platform-specific code anyway…
       - name: upload coverage
-        if: matrix.os == 'ubuntu-latest' && matrix.node == 20
+        if: matrix.os == 'ubuntu-latest' && matrix.node == latest
         timeout-minutes: 1
         continue-on-error: true
         run: bash <(curl -s https://codecov.io/bash) -t ${{secrets.CODECOV_TOKEN}} -B ${{ github.ref }} -f coverage/coverage-final.json
-      # test the minimum supported peer dependency version
-      - run: npm install typescript@4.5 rollup@3.0
-      # aka `npm test` without the `pretest/build`
-      - run: node .build/tests/index.js
+
       # test TypeScript 6 beta
       - run: npm install typescript@beta
+      # aka `npm test` without the `pretest/build`
+      - run: node .build/tests/index.js
+
+      # test the minimum supported peer dependency version
+      - run: npm install typescript@4.5 rollup@3.0
       - run: node .build/tests/index.js
