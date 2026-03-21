@@ -980,18 +980,22 @@ export default (t: Harness) => {
 
   t.test("sourcemap/opt-out-with-rollup-sourcemap-enabled", async () => {
     /**
-     * When dts({ sourcemap: false }), no sourcemaps are generated even if
-     * Rollup's output.sourcemap is true. This gives users clear control:
-     * sourcemap: true = detailed maps, sourcemap: false = no maps.
+     * When dts({ sourcemap: false }), the plugin returns map: null from
+     * transform (no detailed sourcemaps). Rollup may still produce basic
+     * line-level mappings in the output since output.sourcemap is true,
+     * but the plugin should not warn about missing sourcemaps.
      */
 
     const dir = path.resolve(process.cwd(), "tests/sourcemap-fixtures/src");
     const inputPath = path.join(dir, "user.ts");
 
+    const warnings: string[] = [];
     const bundle = await rollup({
       input: inputPath,
       plugins: [dts({ sourcemap: false })],
-      onwarn() {},
+      onwarn(warning) {
+        warnings.push(String(warning.message || warning));
+      },
     });
 
     const result = await bundle.generate({
@@ -1000,13 +1004,17 @@ export default (t: Harness) => {
     });
 
     const chunk = result.output[0];
-    const map = chunk.map;
 
-    // No actual mappings should be generated when sourcemap: false
-    // Rollup may produce empty line separators (semicolons only) but no real segments
-    const decoded = decode(map?.mappings || "");
-    const totalSegments = decoded.reduce((sum, line) => sum + line.length, 0);
-    assert.strictEqual(totalSegments, 0, `Expected no mapping segments when sourcemap: false, got ${totalSegments}`);
+    // The plugin should not trigger "sourcemap is likely to be incorrect" warnings
+    const sourcemapWarnings = warnings.filter((w) => w.includes("sourcemap"));
+    assert.strictEqual(
+      sourcemapWarnings.length,
+      0,
+      `Expected no sourcemap warnings, got: ${sourcemapWarnings.join("; ")}`,
+    );
+
+    // Output should still have a map object (from Rollup's output.sourcemap: true)
+    assert.ok(chunk.map, "Expected a map object in output when output.sourcemap is true");
   });
 
   t.test("sourcemap/compiler-override-precedence", async () => {

@@ -114,7 +114,7 @@ export const transform = (enableSourcemap: boolean) => {
       }
 
       if (!enableSourcemap) {
-        return { code, ast: converted.ast as any };
+        return { code, ast: converted.ast as any, map: null };
       }
 
       // hires:true generates per-character mappings instead of per-line.
