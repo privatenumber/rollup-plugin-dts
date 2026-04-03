@@ -555,7 +555,10 @@ function formatChunkImportPath(fromFileName: string, toFileName: string): string
   if (!relative.startsWith(".")) {
     relative = "./" + relative;
   }
-  return relative.replace(/\.d\.ts$/, ".js");
+  return relative
+    .replace(/\.d\.ts$/, ".js")
+    .replace(/\.d\.mts$/, ".mjs")
+    .replace(/\.d\.cts$/, ".cjs");
 }
 
 function updateSourcemapAsset(
