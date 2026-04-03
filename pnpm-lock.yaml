@@ -17,9 +17,6 @@ importers:
       convert-source-map:
         specifier: ^2.0.0
         version: 2.0.0
-      es-module-lexer:
-        specifier: ^2.0.0
-        version: 2.0.0
       magic-string:
         specifier: ^0.30.21
         version: 0.30.21
@@ -304,9 +301,6 @@ packages:
 
   emoji-regex@8.0.0:
     resolution: {integrity: sha512-MSjYzcWNOA0ewAHpz0MxpYFvwg6yjy1NG3xteoqz644VCo/RPgnr1/GGt+ic3iJTzQ8Eu3TdM14SawnVUmGE6A==}
-
-  es-module-lexer@2.0.0:
-    resolution: {integrity: sha512-5POEcUuZybH7IdmGsD8wlf0AI55wMecM9rVBTI/qEAy2c1kTOm3DjFYjrBdI2K3BaJjJYfYFeRtM0t9ssnRuxw==}
 
   escalade@3.2.0:
     resolution: {integrity: sha512-WUj2qlxaQtO4g6Pq5c29GTcWGDyd8itL8zTlipgECz3JesAiiOKotd8JU6otB3PACgG6xkJUyVhboMS+bje/jA==}
@@ -668,8 +662,6 @@ snapshots:
   csstype@3.2.3: {}
 
   emoji-regex@8.0.0: {}
-
-  es-module-lexer@2.0.0: {}
 
   escalade@3.2.0: {}
 

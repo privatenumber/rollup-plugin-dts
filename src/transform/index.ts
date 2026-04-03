@@ -2,7 +2,7 @@ import * as path from "node:path";
 import type { OutputChunk, Plugin, SourceMap } from "rollup";
 import remapping from "@jridgewell/remapping";
 import type { RawSourceMap } from "@jridgewell/remapping";
-import { init as initLexer, parse as parseEsm } from "es-module-lexer";
+import ts from "typescript";
 import { NamespaceFixer } from "./NamespaceFixer.js";
 import { preProcess } from "./preprocess.js";
 import { convert } from "./Transformer.js";
@@ -202,7 +202,7 @@ export const transform = (enableSourcemap: boolean) => {
       // When multiple entries import the same module, Rollup extracts it into a shared
       // chunk (e.g. shared.d-BwjD5eaf.d.ts). These aren't in the package's exports map,
       // causing TS2742/TS2883 errors for downstream consumers.
-      await mergeSharedChunks(bundle);
+      mergeSharedChunks(bundle);
 
       // Fix sourcemap sources to point to original .ts files
       // When input .d.ts files have associated .d.ts.map files pointing to original .ts sources,
@@ -416,7 +416,7 @@ type SourcemapData = {
  * Other importing entries have their import rewritten to point to the host.
  * The shared chunk (and its sourcemap asset) is then deleted from the bundle.
  */
-async function mergeSharedChunks(bundle: Record<string, OutputChunk | { type: string }>) {
+function mergeSharedChunks(bundle: Record<string, OutputChunk | { type: string }>) {
   const chunks = new Map<string, OutputChunk>();
   for (const [fileName, item] of Object.entries(bundle)) {
     if (item.type === "chunk") {
@@ -427,32 +427,27 @@ async function mergeSharedChunks(bundle: Record<string, OutputChunk | { type: st
   const sharedChunks = [...chunks.values()].filter((c) => !c.isEntry);
   if (sharedChunks.length === 0) return;
 
-  await initLexer;
-
   for (const shared of sharedChunks) {
     const importingEntries = [...chunks.values()].filter(
       (c) => c.isEntry && c.imports.includes(shared.fileName),
     );
     if (importingEntries.length === 0) continue;
 
-    // Use the lexer to find the export statement in the shared chunk,
-    // then extract everything before it as declarations
+    // Parse the shared chunk to extract declarations (everything except export statements)
     const sharedDeclarations = extractDeclarations(shared.code);
 
     const host = importingEntries[0]!;
 
-    // Find and remove the host's import from the shared chunk, prepend declarations
+    // Find the host's import from the shared chunk
     const hostImport = findImportByChunk(host.code, shared.fileName);
     if (!hostImport) continue;
 
-    // Parse import bindings to build the name mapping:
-    // shared export name → host local alias (e.g. S → Shared)
-    const hostBindings = parseImportBindings(host.code, hostImport);
+    // Build the name mapping: shared export name → host local alias (e.g. S → Shared)
+    const hostBindings = getImportBindings(hostImport.node);
 
+    // Remove the import, prepend shared declarations
     const hostCode = new MagicString(host.code);
-    // Remove import statement (se excludes the trailing `;`) plus newline
-    const hostRemoveEnd = statementEnd(host.code, hostImport.se);
-    hostCode.remove(hostImport.ss, hostRemoveEnd);
+    hostCode.remove(hostImport.start, hostImport.end);
     hostCode.prepend(sharedDeclarations);
     host.code = hostCode.toString();
 
@@ -462,7 +457,7 @@ async function mergeSharedChunks(bundle: Record<string, OutputChunk | { type: st
       const entryImport = findImportByChunk(entry.code, shared.fileName);
       if (!entryImport) continue;
 
-      const entryBindings = parseImportBindings(entry.code, entryImport);
+      const entryBindings = getImportBindings(entryImport.node);
 
       // Map each binding to the host's export name
       const specifiers = entryBindings.map(({ imported, local }) => {
@@ -473,9 +468,11 @@ async function mergeSharedChunks(bundle: Record<string, OutputChunk | { type: st
 
       const hostRef = formatChunkImportPath(entry.fileName, host.fileName);
       const entryCode = new MagicString(entry.code);
-      // Overwrite the full statement including the trailing `;`
-      const entryOverwriteEnd = statementEnd(entry.code, entryImport.se, true);
-      entryCode.overwrite(entryImport.ss, entryOverwriteEnd, `import { ${specifiers.join(", ")} } from '${hostRef}';`);
+      entryCode.overwrite(
+        entryImport.start,
+        entryImport.end,
+        `import { ${specifiers.join(", ")} } from '${hostRef}';\n`,
+      );
       entry.code = entryCode.toString();
     }
 
@@ -484,84 +481,71 @@ async function mergeSharedChunks(bundle: Record<string, OutputChunk | { type: st
   }
 }
 
-/** Extract declarations from a chunk by removing the trailing export statement */
+/** Extract declarations from a chunk by removing export statements (using TS AST) */
 function extractDeclarations(code: string): string {
-  const [, exports] = parseEsm(code);
-  if (exports.length === 0) return code;
+  const sourceFile = ts.createSourceFile("chunk.d.ts", code, ts.ScriptTarget.Latest, true);
+  const result = new MagicString(code);
 
-  // Find the last export statement and remove everything from its line start
-  // The export `s` points to the exported name inside `export { name }`,
-  // so we search backwards from the first export's position for `export`
-  const firstExportPos = exports[0]!.s;
-  const exportKeyword = code.lastIndexOf("export", firstExportPos);
-  if (exportKeyword === -1) return code;
-
-  // Include the preceding newline in the removal
-  let start = exportKeyword;
-  if (start > 0 && code[start - 1] === "\n") {
-    start -= 1;
+  for (const statement of sourceFile.statements) {
+    if (ts.isExportDeclaration(statement)) {
+      // Remove `export { ... };` and its trailing newline
+      let end = statement.end;
+      if (code[end] === "\n") {
+        end += 1;
+      }
+      result.remove(statement.pos, end);
+    }
   }
-  return code.slice(0, start) + "\n";
+
+  return result.toString();
 }
 
 type ImportBinding = { imported: string; local: string };
 
+type FoundImport = {
+  node: ts.ImportDeclaration;
+  start: number;
+  end: number;
+};
+
 /**
  * Find the import statement that references a given chunk fileName.
- * Uses es-module-lexer for precise position tracking.
+ * Uses TypeScript's parser for correct handling of .d.ts syntax.
  */
-function findImportByChunk(
-  code: string,
-  chunkFileName: string,
-): { ss: number; se: number; s: number; e: number } | null {
-  const [imports] = parseEsm(code);
+function findImportByChunk(code: string, chunkFileName: string): FoundImport | null {
+  const sourceFile = ts.createSourceFile("chunk.d.ts", code, ts.ScriptTarget.Latest, true);
   const chunkBase = trimExtension(chunkFileName);
 
-  for (const imp of imports) {
-    if (!imp.n) continue;
-    // Rollup emits imports with .js extension; the chunk has .d.ts
-    // Strip leading ./ and extension, then compare
-    const specBase = trimExtension(imp.n.replace(/^\.\//, ""));
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement)) continue;
+    if (!ts.isStringLiteral(statement.moduleSpecifier)) continue;
+
+    const specifier = statement.moduleSpecifier.text;
+    const specBase = trimExtension(specifier.replace(/^\.\//, ""));
     if (specBase === chunkBase) {
-      return { ss: imp.ss, se: imp.se, s: imp.s, e: imp.e };
+      // Include trailing newline in the range for clean removal
+      let end = statement.end;
+      if (code[end] === "\n") {
+        end += 1;
+      }
+      return { node: statement, start: statement.getFullStart(), end };
     }
   }
   return null;
 }
 
-/** Parse the binding list from an import statement found by the lexer */
-function parseImportBindings(
-  code: string,
-  imp: { ss: number; se: number },
-): ImportBinding[] {
-  const statement = code.slice(imp.ss, imp.se);
-  const braceOpen = statement.indexOf("{");
-  const braceClose = statement.indexOf("}");
-  if (braceOpen === -1 || braceClose === -1) return [];
+/** Extract import bindings from a parsed ImportDeclaration */
+function getImportBindings(node: ts.ImportDeclaration): ImportBinding[] {
+  const bindings: ImportBinding[] = [];
+  const namedBindings = node.importClause?.namedBindings;
+  if (!namedBindings || !ts.isNamedImports(namedBindings)) return bindings;
 
-  const bindingText = statement.slice(braceOpen + 1, braceClose);
-  return bindingText.split(",").map((spec) => {
-    const parts = spec.trim().split(/\s+as\s+/);
-    return parts.length === 2
-      ? { imported: parts[0]!, local: parts[1]! }
-      : { imported: parts[0]!, local: parts[0]! };
-  });
-}
-
-/**
- * Find the end of a statement after the lexer's `se` position.
- * es-module-lexer's `se` excludes the trailing `;`.
- * This advances past `;` and optionally the trailing newline.
- */
-function statementEnd(code: string, se: number, keepNewline = false): number {
-  let pos = se;
-  if (code[pos] === ";") {
-    pos += 1;
+  for (const element of namedBindings.elements) {
+    const local = element.name.text;
+    const imported = element.propertyName ? element.propertyName.text : local;
+    bindings.push({ imported, local });
   }
-  if (!keepNewline && code[pos] === "\n") {
-    pos += 1;
-  }
-  return pos;
+  return bindings;
 }
 
 /** Format a relative import path from one chunk to another */
