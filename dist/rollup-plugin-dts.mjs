@@ -632,7 +632,6 @@ class LanguageService {
 
 class TypeOnlyFixer {
     constructor(fileName, rawCode) {
-        this.DEBUG = !!process.env.DTS_EXPORTS_FIXER_DEBUG;
         this.types = new Set();
         this.values = new Set();
         this.typeHints = new Map();
@@ -770,7 +769,6 @@ class TypeOnlyFixer {
     }
     analyze(nodes) {
         for (const node of nodes) {
-            this.DEBUG && console.log(node.getText(), node.kind);
             if (ts.isImportDeclaration(node) && node.importClause) {
                 this.importNodes.push(node);
                 continue;
@@ -780,13 +778,11 @@ class TypeOnlyFixer {
                 continue;
             }
             if (ts.isInterfaceDeclaration(node)) {
-                this.DEBUG && console.log(`${node.name.getFullText()} is a type`);
                 this.types.add(node.name.text);
                 continue;
             }
             if (ts.isTypeAliasDeclaration(node)) {
                 const alias = node.name.text;
-                this.DEBUG && console.log(`${node.name.getFullText()} is a type`);
                 this.types.add(alias);
                 /**
                  * TODO: type-only import/export fixer.
@@ -819,14 +815,12 @@ class TypeOnlyFixer {
                 if (ts.isVariableStatement(node)) {
                     for (const declaration of node.declarationList.declarations) {
                         if (ts.isIdentifier(declaration.name)) {
-                            this.DEBUG && console.log(`${declaration.name.getFullText()} is a value (from var statement)`);
                             this.values.add(declaration.name.text);
                         }
                     }
                 }
                 else {
                     if (node.name) {
-                        this.DEBUG && console.log(`${node.name.getFullText()} is a value (from declaration)`);
                         this.values.add(node.name.text);
                     }
                 }
@@ -838,13 +832,11 @@ class TypeOnlyFixer {
             }
             if (ts.isModuleDeclaration(node)) {
                 if (node.name && ts.isIdentifier(node.name)) {
-                    this.DEBUG && console.log(`${node.name.getFullText()} is a value (from module declaration)`);
                     this.values.add(node.name.text);
                 }
                 this.analyze(node.getChildren());
                 continue;
             }
-            this.DEBUG && console.log("unhandled statement", node.getFullText(), node.kind);
         }
     }
     // The type-hint statements may lead to redundant import statements.
@@ -869,6 +861,99 @@ class TypeOnlyFixer {
 function getNodeIndent(node) {
     const match = node.getFullText().match(/^(?:\n*)([ ]*)/);
     return ' '.repeat(match?.[1]?.length || 0);
+}
+
+const RESOLVED_MODULE_PREFIX = "dts-resolved:";
+const RESOLVED_MODULE_COMMENT = new RegExp(`\\/\\*${RESOLVED_MODULE_PREFIX}(.+?)\\*\\/`);
+/** Encode a resolved absolute path as a marker comment for later chunk resolution. */
+function encodeResolvedModule(absolutePath) {
+    return `/*${RESOLVED_MODULE_PREFIX}${absolutePath}*/`;
+}
+/** Decode a resolved module marker comment from text. Returns the absolute path, or null if not found. */
+function decodeResolvedModule(text) {
+    return text.match(RESOLVED_MODULE_COMMENT)?.[1] ?? null;
+}
+/** Strip the resolved module marker comment. */
+function stripResolvedModuleComment(text) {
+    return text.replace(RESOLVED_MODULE_COMMENT, "");
+}
+/** Normalize paths for comparison (handle Windows backslashes) */
+function normalizePath(p) {
+    return p.split("\\").join("/");
+}
+class ModuleDeclarationFixer {
+    constructor(chunk, code, sourcemap, moduleToChunk, warn) {
+        this.code = code;
+        this.sourcemap = sourcemap;
+        this.source = parse(chunk.fileName, code.toString());
+        this.chunkFileName = chunk.fileName;
+        this.moduleToChunk = moduleToChunk;
+        this.warn = warn;
+    }
+    fix() {
+        let modified = false;
+        for (const node of this.source.statements) {
+            if (!ts.isModuleDeclaration(node) || !node.body || !ts.isModuleBlock(node.body)) {
+                continue;
+            }
+            const sourceText = this.source.getFullText();
+            const textBetween = sourceText.slice(node.name.getEnd(), node.body.getStart());
+            const absolutePath = decodeResolvedModule(textBetween);
+            if (!absolutePath) {
+                continue;
+            }
+            const targetChunkName = this.getTargetChunkName(absolutePath);
+            const quote = node.name.kind === ts.SyntaxKind.StringLiteral && "singleQuote" in node.name && node.name.singleQuote
+                ? "'"
+                : '"';
+            const cleanedBetween = stripResolvedModuleComment(textBetween);
+            this.code.overwrite(node.name.getStart(), node.body.getStart(), `${quote}${targetChunkName}${quote}${cleanedBetween}`);
+            modified = true;
+        }
+        return {
+            code: this.code.toString(),
+            map: modified && this.sourcemap ? this.code.generateMap() : null,
+        };
+    }
+    /**
+     * Get the output chunk name for an absolute module path.
+     */
+    getTargetChunkName(absolutePath) {
+        // Detect JS extension from the resolved path (present when the source uses ESM-style specifiers)
+        const jsExtMatch = absolutePath.match(/\.[cm]?js$/);
+        const basePath = jsExtMatch ? absolutePath.slice(0, -jsExtMatch[0].length) : absolutePath;
+        // Try all file extensions that could appear as module IDs in Rollup's chunk metadata
+        const extensions = ["", ".d.ts", ".d.mts", ".d.cts", ".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"];
+        const possiblePaths = extensions.map((ext) => basePath + ext);
+        // Find which chunk contains this module
+        for (const possiblePath of possiblePaths) {
+            const chunkFileName = this.moduleToChunk.get(normalizePath(possiblePath));
+            if (chunkFileName) {
+                return this.formatChunkReference(chunkFileName, jsExtMatch?.[0]);
+            }
+        }
+        // Module is not found in any chunk, keep the current chunk name as a fallback
+        this.warn(`declare module "${absolutePath}" could not be resolved to any output chunk, falling back to current chunk "${this.chunkFileName}"`);
+        return this.formatChunkReference(this.chunkFileName, jsExtMatch?.[0]);
+    }
+    /**
+     * Format a chunk filename as a relative path from the current chunk.
+     */
+    formatChunkReference(chunkFileName, jsExt) {
+        // Compute the relative path from the current chunk's directory to the target chunk
+        const chunkDir = path.dirname(this.chunkFileName);
+        let relativePath = normalizePath(path.relative(chunkDir, chunkFileName));
+        // Strip declaration extension and apply JS extension if the source used one
+        relativePath = relativePath.replace(/\.d\.[cm]?tsx?$/, "");
+        if (jsExt) {
+            relativePath += jsExt;
+        }
+        // Ensure it starts with "./"
+        if (!relativePath.startsWith(".")) {
+            relativePath = "./" + relativePath;
+        }
+        return relativePath;
+    }
 }
 
 function preProcessNamespaceBody(body, code, sourceFile) {
@@ -1166,6 +1251,20 @@ function preProcess({ sourceFile, isEntry, isJSON }) {
         }
         code.remove(start, end);
     }
+    // Resolve relative module declarations to absolute paths
+    // This allows correct chunk resolution later even when files from different
+    // directories are bundled together
+    const sourceDir = path.dirname(sourceFile.fileName);
+    for (const node of sourceFile.statements) {
+        if (ts.isModuleDeclaration(node) &&
+            node.body &&
+            ts.isModuleBlock(node.body) &&
+            ts.isStringLiteral(node.name) &&
+            /^\.\.?\//.test(node.name.text)) {
+            const resolvedPath = path.resolve(sourceDir, node.name.text);
+            code.appendRight(node.name.getEnd(), encodeResolvedModule(resolvedPath));
+        }
+    }
     // Strip trailing sourceMappingURL comments so they don't leak into bundled output
     const fullText = sourceFile.getFullText();
     // Check EOF token's leading trivia (comment on its own line after last statement)
@@ -1180,7 +1279,7 @@ function preProcess({ sourceFile, isEntry, isJSON }) {
         if (comment.kind !== ts.SyntaxKind.SingleLineCommentTrivia)
             continue;
         const text = fullText.slice(comment.pos, comment.end);
-        if (!/\/\/[#@]\s*sourceMappingURL=/.test(text))
+        if (!/^\/\/[#@]\s*sourceMappingURL=/.test(text))
             continue;
         let start = comment.pos;
         if (start > 0 && fullText[start - 1] === "\n") {
@@ -2055,43 +2154,6 @@ class Transformer {
     }
 }
 
-class RelativeModuleDeclarationFixer {
-    constructor(fileName, code, sourcemap, name) {
-        this.sourcemap = sourcemap;
-        this.DEBUG = !!process.env.DTS_EXPORTS_FIXER_DEBUG;
-        this.relativeModuleDeclarations = [];
-        this.source = parse(fileName, code.toString());
-        this.code = code;
-        this.name = name || "./index";
-    }
-    fix() {
-        this.analyze(this.source.statements);
-        for (const node of this.relativeModuleDeclarations) {
-            const start = node.getStart();
-            const end = node.getEnd();
-            const quote = node.name.kind === ts.SyntaxKind.StringLiteral && "singleQuote" in node.name && node.name.singleQuote
-                ? "'"
-                : '"';
-            const code = `declare module ${quote}${this.name}${quote} ${node.body.getText()}`;
-            this.code.overwrite(start, end, code);
-        }
-        return {
-            code: this.code.toString(),
-            map: this.relativeModuleDeclarations.length && this.sourcemap ? this.code.generateMap() : null,
-        };
-    }
-    analyze(nodes) {
-        for (const node of nodes) {
-            if (ts.isModuleDeclaration(node) && node.body && ts.isModuleBlock(node.body) && /^\.\.?\//.test(node.name.text)) {
-                if (this.DEBUG) {
-                    console.log(`Found relative module declaration: ${node.name.text} in ${this.source.fileName}`);
-                }
-                this.relativeModuleDeclarations.push(node);
-            }
-        }
-    }
-}
-
 /**
  * Hydrate sparse sourcemap with detailed segments from input map.
  *
@@ -2205,6 +2267,291 @@ async function loadInputSourcemap(info) {
     }
 }
 
+function rewritePortableSharedChunkImportsInBundle(bundle, warn) {
+    const chunks = Object.values(bundle).filter(isOutputChunk);
+    const sharedChunks = chunks.filter((chunk) => !chunk.isEntry);
+    if (sharedChunks.length === 0)
+        return;
+    const entryChunks = chunks.filter((chunk) => chunk.isEntry);
+    const chunkGraph = new Map(chunks.map((chunk) => [
+        chunk.fileName,
+        {
+            exports: chunk.exports,
+            isEntry: chunk.isEntry,
+        },
+    ]));
+    const analyses = new Map(chunks.map((chunk) => [chunk.fileName, analyzeChunk(chunk, chunkGraph)]));
+    for (const chunk of entryChunks) {
+        const analysis = analyses.get(chunk.fileName);
+        const magicCode = new MagicString(chunk.code);
+        let hasChanges = false;
+        const unresolvedSymbols = new Set();
+        for (const statement of analysis.importStatements) {
+            const sharedChunk = sharedChunks.find((candidate) => getChunkImportSpecifier(chunk.fileName, candidate.fileName) === statement.moduleSpecifier);
+            if (!sharedChunk) {
+                continue;
+            }
+            const keptSpecifiers = [];
+            const rewrittenSpecifiers = new Map();
+            for (const specifier of statement.specifiers) {
+                if (hasPublicHostRoute(analysis, statement.moduleSpecifier, specifier.importedName)) {
+                    keptSpecifiers.push(specifier);
+                    continue;
+                }
+                const hostCandidate = pickHostCandidate(entryChunks, analyses, chunk.fileName, sharedChunk.fileName, specifier);
+                if (!hostCandidate) {
+                    keptSpecifiers.push(specifier);
+                    unresolvedSymbols.add(specifier.localName);
+                    continue;
+                }
+                const hostSpecifier = getChunkImportSpecifier(chunk.fileName, hostCandidate.chunk.fileName);
+                const hostImportSpecifiers = rewrittenSpecifiers.get(hostSpecifier) || [];
+                hostImportSpecifiers.push({
+                    importedName: hostCandidate.exportedName,
+                    isTypeOnly: specifier.isTypeOnly || hostCandidate.isTypeOnly,
+                    localName: specifier.localName,
+                });
+                rewrittenSpecifiers.set(hostSpecifier, hostImportSpecifiers);
+            }
+            if (!rewrittenSpecifiers.size) {
+                continue;
+            }
+            const replacementStatements = [];
+            if (keptSpecifiers.length) {
+                replacementStatements.push(buildImportStatement(statement, keptSpecifiers, statement.moduleSpecifier, statement.quote));
+            }
+            const hostSpecifiers = Array.from(rewrittenSpecifiers.keys()).sort(compareStrings);
+            for (const hostSpecifier of hostSpecifiers) {
+                replacementStatements.push(buildImportStatement(statement, rewrittenSpecifiers.get(hostSpecifier), hostSpecifier, statement.quote));
+            }
+            magicCode.overwrite(statement.statement.getStart(), statement.statement.getEnd(), replacementStatements.join("\n"));
+            hasChanges = true;
+        }
+        if (hasChanges) {
+            applyChunkEdits(chunk, magicCode);
+        }
+        if (unresolvedSymbols.size) {
+            warn(formatUnresolvedSharedTypeWarning(chunk.fileName, unresolvedSymbols));
+        }
+    }
+}
+function analyzeChunk(chunk, chunkGraph) {
+    const source = parse(chunk.fileName, chunk.code);
+    const importStatements = [];
+    const importedBindings = new Map();
+    const hostRoutesByModule = new Map();
+    const starExports = [];
+    for (const statement of source.statements) {
+        if (ts.isImportDeclaration(statement) &&
+            !statement.importClause?.name &&
+            ts.isStringLiteral(statement.moduleSpecifier) &&
+            statement.importClause?.namedBindings &&
+            ts.isNamedImports(statement.importClause.namedBindings)) {
+            const moduleSpecifier = statement.moduleSpecifier.text;
+            const quote = statement.moduleSpecifier.getText(source).startsWith('"') ? '"' : "'";
+            const specifiers = statement.importClause.namedBindings.elements.map((element) => {
+                const specifier = {
+                    importedName: element.propertyName?.text || element.name.text,
+                    isTypeOnly: element.isTypeOnly || statement.importClause?.isTypeOnly || false,
+                    localName: element.name.text,
+                };
+                importedBindings.set(specifier.localName, {
+                    importedName: specifier.importedName,
+                    isTypeOnly: specifier.isTypeOnly,
+                    moduleSpecifier,
+                });
+                return specifier;
+            });
+            importStatements.push({
+                isTypeOnly: statement.importClause.isTypeOnly,
+                moduleSpecifier,
+                quote,
+                specifiers,
+                statement,
+            });
+            continue;
+        }
+        if (!ts.isExportDeclaration(statement) || !statement.moduleSpecifier || !ts.isStringLiteral(statement.moduleSpecifier)) {
+            continue;
+        }
+        if (!statement.exportClause) {
+            starExports.push(statement.moduleSpecifier.text);
+            continue;
+        }
+        if (!ts.isNamedExports(statement.exportClause)) {
+            continue;
+        }
+        for (const element of statement.exportClause.elements) {
+            addHostExportRoute(hostRoutesByModule, statement.moduleSpecifier.text, element.propertyName?.text || element.name.text, {
+                exportedName: element.name.text,
+                isTypeOnly: statement.isTypeOnly || element.isTypeOnly,
+            });
+        }
+    }
+    for (const statement of source.statements) {
+        if (!ts.isExportDeclaration(statement) ||
+            statement.moduleSpecifier ||
+            !statement.exportClause ||
+            !ts.isNamedExports(statement.exportClause)) {
+            continue;
+        }
+        for (const element of statement.exportClause.elements) {
+            const localName = element.propertyName?.text || element.name.text;
+            const binding = importedBindings.get(localName);
+            if (!binding) {
+                continue;
+            }
+            addHostExportRoute(hostRoutesByModule, binding.moduleSpecifier, binding.importedName, {
+                exportedName: element.name.text,
+                isTypeOnly: binding.isTypeOnly || statement.isTypeOnly || element.isTypeOnly,
+            });
+        }
+    }
+    for (const moduleSpecifier of starExports) {
+        const sharedChunk = Array.from(chunkGraph.entries()).find(([candidateFileName, candidate]) => !candidate.isEntry && getChunkImportSpecifier(chunk.fileName, candidateFileName) === moduleSpecifier);
+        if (!sharedChunk) {
+            continue;
+        }
+        for (const exportedName of sharedChunk[1].exports) {
+            if (exportedName === "default") {
+                continue;
+            }
+            addHostExportRoute(hostRoutesByModule, moduleSpecifier, exportedName, {
+                exportedName,
+                isTypeOnly: false,
+            });
+        }
+    }
+    return {
+        hostRoutesByModule,
+        importStatements,
+    };
+}
+const isOutputChunk = (chunk) => chunk.type === "chunk";
+function pickHostCandidate(entryChunks, analyses, currentChunkFileName, sharedChunkFileName, specifier) {
+    const candidates = [];
+    for (const hostChunk of entryChunks) {
+        if (hostChunk.fileName === currentChunkFileName) {
+            continue;
+        }
+        const hostAnalysis = analyses.get(hostChunk.fileName);
+        const sharedSpecifier = getChunkImportSpecifier(hostChunk.fileName, sharedChunkFileName);
+        const routes = getHostExportRoutes(hostAnalysis, sharedSpecifier, specifier.importedName);
+        for (const route of routes) {
+            candidates.push({
+                ...route,
+                chunk: hostChunk,
+            });
+        }
+    }
+    candidates.sort((left, right) => {
+        const leftMatchesLocal = left.exportedName === specifier.localName ? 0 : 1;
+        const rightMatchesLocal = right.exportedName === specifier.localName ? 0 : 1;
+        if (leftMatchesLocal !== rightMatchesLocal) {
+            return leftMatchesLocal - rightMatchesLocal;
+        }
+        const fileNameOrder = compareStrings(left.chunk.fileName, right.chunk.fileName);
+        if (fileNameOrder !== 0) {
+            return fileNameOrder;
+        }
+        return compareStrings(left.exportedName, right.exportedName);
+    });
+    return candidates[0];
+}
+const getHostExportRoutes = (analysis, moduleSpecifier, importedName) => analysis.hostRoutesByModule.get(moduleSpecifier)?.get(importedName) || [];
+const hasPublicHostRoute = (analysis, moduleSpecifier, importedName) => getHostExportRoutes(analysis, moduleSpecifier, importedName).length > 0;
+const compareStrings = (left, right) => {
+    if (left < right) {
+        return -1;
+    }
+    if (left > right) {
+        return 1;
+    }
+    return 0;
+};
+function addHostExportRoute(hostRoutesByModule, moduleSpecifier, importedName, route) {
+    const routesByImportedName = hostRoutesByModule.get(moduleSpecifier) || new Map();
+    const routes = routesByImportedName.get(importedName) || [];
+    if (!routes.some((existing) => existing.exportedName === route.exportedName && existing.isTypeOnly === route.isTypeOnly)) {
+        routes.push(route);
+    }
+    routesByImportedName.set(importedName, routes);
+    hostRoutesByModule.set(moduleSpecifier, routesByImportedName);
+}
+function buildImportStatement(statement, specifiers, moduleSpecifier, quote) {
+    const useTypeOnlyImport = statement.isTypeOnly || specifiers.every((specifier) => specifier.isTypeOnly);
+    const importKeyword = useTypeOnlyImport ? "import type" : "import";
+    const namedImports = specifiers
+        .map((specifier) => {
+        const prefix = !useTypeOnlyImport && specifier.isTypeOnly ? "type " : "";
+        if (specifier.importedName === specifier.localName) {
+            return `${prefix}${specifier.importedName}`;
+        }
+        return `${prefix}${specifier.importedName} as ${specifier.localName}`;
+    })
+        .join(", ");
+    return `${importKeyword} { ${namedImports} } from ${quote}${moduleSpecifier}${quote};`;
+}
+function applyChunkEdits(chunk, code) {
+    const nextCode = code.toString();
+    if (nextCode === chunk.code) {
+        return;
+    }
+    if (chunk.map) {
+        const chunkFileName = normalizeChunkPath(chunk.fileName);
+        const rewriteMap = code.generateMap({
+            file: chunkFileName,
+            hires: true,
+            includeContent: true,
+            source: chunkFileName,
+        });
+        const remapped = remapping(rewriteMap, (file) => {
+            if (normalizeChunkPath(file) === chunkFileName) {
+                return chunk.map;
+            }
+            return null;
+        });
+        chunk.map = {
+            ...chunk.map,
+            mappings: typeof remapped.mappings === "string" ? remapped.mappings : "",
+            names: remapped.names || [],
+            sources: remapped.sources,
+        };
+        delete chunk.map.sourcesContent;
+    }
+    chunk.code = nextCode;
+}
+const formatUnresolvedSharedTypeWarning = (chunkFileName, symbols) => {
+    const symbolList = Array.from(symbols).sort().join(", ");
+    return [
+        `Entry "${chunkFileName}" still references private shared type exports with no public re-export: ${symbolList}.`,
+        "rollup-plugin-dts will not invent new public exports for these types.",
+        "Re-export them from a public entry to avoid downstream TS2742 errors.",
+    ].join(" ");
+};
+const getChunkImportSpecifier = (fromChunkFileName, toChunkFileName) => {
+    const fromDir = path.posix.dirname(normalizeChunkPath(fromChunkFileName));
+    const toRuntimeFileName = getChunkRuntimeFileName(normalizeChunkPath(toChunkFileName));
+    let relativePath = path.posix.relative(fromDir, toRuntimeFileName);
+    if (!relativePath.startsWith(".")) {
+        relativePath = `./${relativePath}`;
+    }
+    return relativePath;
+};
+const getChunkRuntimeFileName = (fileName) => {
+    if (fileName.endsWith(".d.mts")) {
+        return `${fileName.slice(0, -6)}.mjs`;
+    }
+    if (fileName.endsWith(".d.cts")) {
+        return `${fileName.slice(0, -6)}.cjs`;
+    }
+    if (fileName.endsWith(".d.ts")) {
+        return `${fileName.slice(0, -5)}.js`;
+    }
+    return `${fileName}.js`;
+};
+const normalizeChunkPath = (fileName) => fileName.replaceAll("\\", "/");
+
 /**
  * This is the *transform* part of `rollup-plugin-dts`.
  *
@@ -2271,7 +2618,7 @@ const transform = (enableSourcemap) => {
                 strict: false,
             };
         },
-        transform(code, fileName, inputMapText) {
+        transform(code, fileName, inputMapTextOrOptions) {
             // `fileName` may not match the name in the moduleIds,
             // as we generate the `fileName` manually in the previews step,
             // so we need to find the correct moduleId.
@@ -2280,6 +2627,7 @@ const transform = (enableSourcemap) => {
             const moduleId = Array.from(moduleIds).find((id) => trimExtension(id) === name);
             const isEntry = Boolean(moduleId && this.getModuleInfo(moduleId)?.isEntry);
             const isJSON = Boolean(moduleId && JSON_EXTENSIONS.test(moduleId));
+            const inputMapText = typeof inputMapTextOrOptions === 'string' ? inputMapTextOrOptions : undefined;
             // Preserve original code for loadInputSourcemap() before preProcess strips sourceMappingURL
             const rawCode = code;
             let sourceFile = parse(fileName, code);
@@ -2296,7 +2644,7 @@ const transform = (enableSourcemap) => {
                 console.log(JSON.stringify(converted.ast.body, undefined, 2));
             }
             if (!enableSourcemap) {
-                return { code, ast: converted.ast };
+                return { code, ast: converted.ast, map: null };
             }
             // hires:true generates per-character mappings instead of per-line.
             // Without this, Go-to-Definition jumps to line starts instead of identifiers.
@@ -2313,7 +2661,7 @@ const transform = (enableSourcemap) => {
             }
             return { code, ast: converted.ast, map: map };
         },
-        renderChunk(inputCode, chunk, options) {
+        renderChunk(inputCode, chunk, options, meta) {
             const source = parse(chunk.fileName, inputCode);
             const fixer = new NamespaceFixer(source);
             const typeReferences = new Set();
@@ -2348,10 +2696,18 @@ const transform = (enableSourcemap) => {
             }
             const typeOnlyFixer = new TypeOnlyFixer(chunk.fileName, code);
             const typesFixed = typeOnlyFixer.fix();
-            const relativeModuleDeclarationFixed = new RelativeModuleDeclarationFixer(chunk.fileName, "magicCode" in typesFixed && typesFixed.magicCode ? typesFixed.magicCode : new MagicString(code), !!options.sourcemap, "./" + path.basename(chunk.fileName, ".d.ts"));
-            return relativeModuleDeclarationFixed.fix();
+            // Build mapping from module paths to chunk filenames
+            const moduleToChunk = new Map();
+            for (const [chunkFileName, chunkInfo] of Object.entries(meta.chunks)) {
+                for (const moduleId of Object.keys(chunkInfo.modules)) {
+                    moduleToChunk.set(moduleId.split("\\").join("/"), chunkFileName);
+                }
+            }
+            const moduleDeclarationFixer = new ModuleDeclarationFixer(chunk, "magicCode" in typesFixed && typesFixed.magicCode ? typesFixed.magicCode : new MagicString(code), !!options.sourcemap, moduleToChunk, (message) => this.warn(message));
+            return moduleDeclarationFixer.fix();
         },
         async generateBundle(options, bundle) {
+            rewritePortableSharedChunkImportsInBundle(bundle, (message) => this.warn(message));
             // Fix sourcemap sources to point to original .ts files
             // When input .d.ts files have associated .d.ts.map files pointing to original .ts sources,
             // we use sourcemap remapping to compose the transform's map with the input map
@@ -2735,10 +3091,10 @@ const plugin = (options = {}) => {
                 resolvedCompilerOptions = getCompilerOptions(resolvedSource, ctx.resolvedOptions.compilerOptions, ctx.resolvedOptions.tsconfig, ctx.resolvedOptions.sourcemap).compilerOptions;
             }
             // resolve this via typescript
-            // Default moduleResolution to node10 if not explicitly set. TS6 changed
-            // the default from node10 to bundler, and bundler resolution picks .js
-            // files over directories with .d.ts index files, breaking .d.ts bundling.
             const { resolvedModule } = ts.resolveModuleName(source, importer, {
+                // Default moduleResolution to node10 if not explicitly set. TS6 changed
+                // the default from node10 to bundler, and bundler resolution picks .js
+                // files over directories with .d.ts index files, breaking .d.ts bundling.
                 moduleResolution: ts.ModuleResolutionKind.Node10,
                 ...resolvedCompilerOptions,
             }, ts.sys);

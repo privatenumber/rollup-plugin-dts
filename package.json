@@ -1,6 +1,6 @@
 {
   "name": "rollup-plugin-dts",
-  "version": "6.3.0",
+  "version": "6.4.1",
   "description": "A rollup plugin that will bundle up your .d.ts definition files.",
   "keywords": [
     "rollup-plugin",
@@ -22,7 +22,7 @@
   },
   "homepage": "https://github.com/Swatinem/rollup-plugin-dts#readme",
   "engines": {
-    "node": ">=16"
+    "node": ">=20"
   },
   "type": "module",
   "main": "./dist/rollup-plugin-dts.cjs",
@@ -54,10 +54,10 @@
     "@types/convert-source-map": "^2.0.3",
     "@types/d3-drag": "^3.0.7",
     "@types/estree": "1.0.8",
-    "@types/node": "^24.10.14",
+    "@types/node": "^25.5.0",
     "@types/react": "^19.2.14",
-    "c8": "^10.1.3",
-    "rollup": "4.55.1",
+    "c8": "^11.0.0",
+    "rollup": "4.60.0",
     "typescript": "5.9.3"
   },
   "peerDependencies": {
@@ -72,5 +72,10 @@
     "@jridgewell/sourcemap-codec": "^1.5.5",
     "convert-source-map": "^2.0.0",
     "magic-string": "^0.30.21"
+  },
+  "overrides": {
+    "c8": {
+      "yargs": "^18.0.0"
+    }
   }
 }
