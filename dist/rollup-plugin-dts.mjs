@@ -749,7 +749,7 @@ class TypeOnlyFixer {
                     : this.isTypeOnly(name);
                 if (isType) {
                     // export { A as B } from 'a';   ->   export type { A as B } from 'a';
-                    typeNames.push(element.getText());
+                    typeNames.push(getExportSpecifierBinding(element));
                 }
                 else {
                     // export { A as B };   ->   export { A as B };
@@ -861,6 +861,12 @@ class TypeOnlyFixer {
 function getNodeIndent(node) {
     const match = node.getFullText().match(/^(?:\n*)([ ]*)/);
     return ' '.repeat(match?.[1]?.length || 0);
+}
+function getExportSpecifierBinding(element) {
+    if (element.propertyName) {
+        return `${element.propertyName.getText()} as ${element.name.getText()}`;
+    }
+    return element.name.getText();
 }
 
 const RESOLVED_MODULE_PREFIX = "dts-resolved:";
