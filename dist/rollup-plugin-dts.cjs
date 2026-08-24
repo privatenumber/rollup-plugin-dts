@@ -3,9 +3,8 @@
 Object.defineProperty(exports, '__esModule', { value: true });
 
 var path = require('node:path');
-var ts = require('typescript');
-var remapping = require('@jridgewell/remapping');
 var node_module = require('node:module');
+var remapping = require('@jridgewell/remapping');
 var MagicString = require('magic-string');
 var fs = require('node:fs/promises');
 var sourcemapCodec = require('@jridgewell/sourcemap-codec');
@@ -13,23 +12,67 @@ var convert$1 = require('convert-source-map');
 
 var _documentCurrentScript = typeof document !== 'undefined' ? document.currentScript : null;
 function _interopNamespaceDefault(e) {
-    var n = Object.create(null);
-    if (e) {
-        Object.keys(e).forEach(function (k) {
-            if (k !== 'default') {
-                var d = Object.getOwnPropertyDescriptor(e, k);
-                Object.defineProperty(n, k, d.get ? d : {
-                    enumerable: true,
-                    get: function () { return e[k]; }
-                });
-            }
+  var n = Object.create(null);
+  if (e) {
+    Object.keys(e).forEach(function (k) {
+      if (k !== 'default') {
+        var d = Object.getOwnPropertyDescriptor(e, k);
+        Object.defineProperty(n, k, d.get ? d : {
+          enumerable: true,
+          get: function () { return e[k]; }
         });
-    }
-    n.default = e;
-    return Object.freeze(n);
+      }
+    });
+  }
+  n.default = e;
+  return Object.freeze(n);
 }
 
 var path__namespace = /*#__PURE__*/_interopNamespaceDefault(path);
+
+// This module replaces `import ts from "typescript"` in the bundled output
+// (see the typescript-shim plugin in rollup.config.ts).
+//
+// TypeScript 7 (the native compiler) does not ship a compiler API — it only
+// exports `version`. Until the new API arrives in TypeScript 7.1+, users on
+// typescript@7 need the `@typescript/typescript6` compatibility package,
+// which provides the TypeScript 6.0 API.
+//
+// `require` is used instead of static imports so that a missing or API-less
+// `typescript` package can be detected and recovered from at runtime.
+
+const require$1 = node_module.createRequire((typeof document === 'undefined' ? require('u' + 'rl').pathToFileURL(__filename).href : (_documentCurrentScript && _documentCurrentScript.tagName.toUpperCase() === 'SCRIPT' && _documentCurrentScript.src || new URL('rollup-plugin-dts.cjs', document.baseURI).href)));
+
+function loadTypeScript() {
+  let ts;
+  try {
+    ts = require$1("typescript");
+  } catch {
+    // not installed, or an ESM-only entry point that this Node version cannot `require`
+  }
+  if (ts && typeof ts.createProgram === "function") {
+    return ts;
+  }
+  try {
+    return require$1("@typescript/typescript6");
+  } catch {
+    if (ts) {
+      throw new Error(
+        `rollup-plugin-dts requires the TypeScript compiler API. The installed typescript@${ts.version} does not provide it, ` +
+          "and the `@typescript/typescript6` fallback is not installed.\n" +
+          "TypeScript 7 does not ship a compiler API, so please additionally install the compatibility package:\n" +
+          "  npm install -D @typescript/typescript6",
+      );
+    }
+    throw new Error(
+      "rollup-plugin-dts requires the TypeScript compiler API, but the `typescript` package could not be loaded.\n" +
+        "Please install typescript 4.5 - 6.x, or typescript 7 together with the `@typescript/typescript6` compatibility package:\n" +
+        "  npm install -D typescript",
+    );
+  }
+}
+
+var ts = loadTypeScript();
 
 function resolveDefaultOptions(options) {
     return {
@@ -243,6 +286,7 @@ class UnsupportedSyntaxError extends Error {
 }
 
 class NamespaceFixer {
+    sourceFile;
     constructor(sourceFile) {
         this.sourceFile = sourceFile;
     }
@@ -364,7 +408,7 @@ class NamespaceFixer {
                 !ts.isObjectLiteralExpression(obj)) {
                 continue;
             }
-            const exports$1 = [];
+            const exports = [];
             for (const prop of obj.properties) {
                 if (!ts.isPropertyAssignment(prop) ||
                     !(ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name)) ||
@@ -374,7 +418,7 @@ class NamespaceFixer {
                 if (prop.name.text === "__proto__") {
                     continue;
                 }
-                exports$1.push({
+                exports.push({
                     exportedName: prop.name.text,
                     localName: prop.initializer.getText(),
                 });
@@ -382,7 +426,7 @@ class NamespaceFixer {
             // sort in reverse order, since we will do string manipulation
             namespaces.unshift({
                 name,
-                exports: exports$1,
+                exports,
                 location,
             });
         }
@@ -480,7 +524,7 @@ function createReference(id) {
 function createIdentifier(node) {
     return withStartEnd({
         type: "Identifier",
-        name: node.getText(),
+        name: node.text,
     }, node);
 }
 /**
@@ -621,8 +665,9 @@ function matchesModifier(node, flags) {
 }
 
 class LanguageService {
+    fileName = "index.d.ts";
+    service;
     constructor(code) {
-        this.fileName = "index.d.ts";
         const serviceHost = {
             getCompilationSettings: () => ({
                 noEmit: true,
@@ -655,13 +700,17 @@ class LanguageService {
 }
 
 class TypeOnlyFixer {
+    rawCode;
+    code;
+    source;
+    service;
+    types = new Set();
+    values = new Set();
+    typeHints = new Map();
+    reExportTypeHints = new Map();
+    importNodes = [];
+    exportNodes = [];
     constructor(fileName, rawCode) {
-        this.types = new Set();
-        this.values = new Set();
-        this.typeHints = new Map();
-        this.reExportTypeHints = new Map();
-        this.importNodes = [];
-        this.exportNodes = [];
         this.rawCode = rawCode;
         this.source = parse(fileName, rawCode);
         this.code = new MagicString(rawCode);
@@ -911,13 +960,75 @@ function stripResolvedModuleComment(text) {
 function normalizePath(p) {
     return p.split("\\").join("/");
 }
+/** Collect the names declared at the top level of an augmentation body. */
+function getAugmentedNames(body) {
+    const names = [];
+    for (const statement of body.statements) {
+        if ((ts.isInterfaceDeclaration(statement) ||
+            ts.isClassDeclaration(statement) ||
+            ts.isFunctionDeclaration(statement) ||
+            ts.isEnumDeclaration(statement) ||
+            ts.isTypeAliasDeclaration(statement)) &&
+            statement.name) {
+            names.push(statement.name.text);
+        }
+        else if (ts.isVariableStatement(statement)) {
+            for (const declaration of statement.declarationList.declarations) {
+                if (ts.isIdentifier(declaration.name)) {
+                    names.push(declaration.name.text);
+                }
+            }
+        }
+    }
+    return names;
+}
+/**
+ * Rewrites relative `declare module './x'` specifiers in bundled output so they point
+ * at the chunk containing the target module, keeping module augmentations reachable
+ * for consumers.
+ *
+ * preprocess resolves each relative specifier lexically against its source file's
+ * directory and stamps it with a `dts-resolved:` marker comment that rides through
+ * bundling attached to its declaration; this fixer decodes the marker, locates the
+ * target chunk via Rollup's chunk metadata, and overwrites the specifier with a
+ * chunk-relative path.
+ *
+ * The rewrite is skipped (original specifier kept + warning) when:
+ * - the target module is not part of any output chunk (orphaned files, asset-style
+ *   declarations) — a dangling specifier stays inert, while rewriting it would merge
+ *   the augmentation into the wrong module;
+ * - the target chunk does not export every augmented name unchanged (aliased
+ *   re-exports, `Foo` → `Foo$1` deconfliction) — augmentation matches by exported
+ *   name, so retargeting the specifier alone would desynchronize the two.
+ *
+ * Scope: only `./`/`../` specifiers are handled. Bare package names must be preserved
+ * verbatim, since consumers resolve them by name. tsconfig-paths aliases
+ * (`declare module "@/foo"`) are a known limitation — they cannot be resolved
+ * lexically. Supporting them would mean: in preprocess, for specifiers matching a
+ * `compilerOptions.paths` pattern (never for other bare names), resolve with
+ * `ts.resolveModuleName` against the declaring file's compiler options (synchronous,
+ * unlike the plugin context's `resolve`), skip `isExternalLibraryImport` results, and
+ * stamp the resolved file name; the extension probe below already bridges the
+ * remaining `.d.ts`-versus-`.ts` module id gap.
+ */
 class ModuleDeclarationFixer {
-    constructor(chunk, code, sourcemap, moduleToChunk, warn) {
+    code;
+    sourcemap;
+    source;
+    chunkFileName;
+    moduleToChunk;
+    chunks;
+    warn;
+    constructor(chunk, code, sourcemap, moduleToChunk, chunks, warn) {
         this.code = code;
         this.sourcemap = sourcemap;
-        this.source = parse(chunk.fileName, code.toString());
+        // Parse the MagicString's original text, not toString(): the code may already
+        // carry TypeOnlyFixer edits, but overwrite() coordinates always refer to the
+        // original string, so node positions must come from that same text
+        this.source = parse(chunk.fileName, code.original);
         this.chunkFileName = chunk.fileName;
         this.moduleToChunk = moduleToChunk;
+        this.chunks = chunks;
         this.warn = warn;
     }
     fix() {
@@ -932,12 +1043,28 @@ class ModuleDeclarationFixer {
             if (!absolutePath) {
                 continue;
             }
-            const targetChunkName = this.getTargetChunkName(absolutePath);
-            const quote = node.name.kind === ts.SyntaxKind.StringLiteral && "singleQuote" in node.name && node.name.singleQuote
-                ? "'"
-                : '"';
+            const target = this.findTargetChunk(absolutePath);
+            let specifier = node.name.getText();
+            if (target === null) {
+                // Keep the original specifier; consumers resolve it relative to the emitted
+                // chunk, where it will typically dangle (a no-op augmentation) rather than
+                // merge into the wrong module the way a current-chunk rewrite would
+                this.warn(`declare module ${specifier} (${absolutePath}) could not be resolved to any output chunk, keeping the original specifier`);
+            }
+            else if (!this.augmentationApplies(getAugmentedNames(node.body), target.moduleId, target.chunkFileName)) {
+                // Module augmentation matches by the target module's exported names; when the
+                // chunk renamed, dropped, or ambiguously exports an augmented name, retargeting
+                // the specifier would merge the augmentation into the wrong declaration
+                this.warn(`declare module ${specifier} (${absolutePath}) augments names that the target chunk does not export unchanged, keeping the original specifier`);
+            }
+            else {
+                const quote = node.name.kind === ts.SyntaxKind.StringLiteral && "singleQuote" in node.name && node.name.singleQuote
+                    ? "'"
+                    : '"';
+                specifier = `${quote}${this.formatChunkReference(target.chunkFileName, target.jsExt)}${quote}`;
+            }
             const cleanedBetween = stripResolvedModuleComment(textBetween);
-            this.code.overwrite(node.name.getStart(), node.body.getStart(), `${quote}${targetChunkName}${quote}${cleanedBetween}`);
+            this.code.overwrite(node.name.getStart(), node.body.getStart(), specifier + cleanedBetween);
             modified = true;
         }
         return {
@@ -946,25 +1073,53 @@ class ModuleDeclarationFixer {
         };
     }
     /**
-     * Get the output chunk name for an absolute module path.
+     * Find the output chunk containing the module at an absolute path.
+     * Returns null when the module is not part of any output chunk.
      */
-    getTargetChunkName(absolutePath) {
+    findTargetChunk(absolutePath) {
         // Detect JS extension from the resolved path (present when the source uses ESM-style specifiers)
         const jsExtMatch = absolutePath.match(/\.[cm]?js$/);
         const basePath = jsExtMatch ? absolutePath.slice(0, -jsExtMatch[0].length) : absolutePath;
-        // Try all file extensions that could appear as module IDs in Rollup's chunk metadata
-        const extensions = ["", ".d.ts", ".d.mts", ".d.cts", ".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"];
-        const possiblePaths = extensions.map((ext) => basePath + ext);
-        // Find which chunk contains this module
-        for (const possiblePath of possiblePaths) {
-            const chunkFileName = this.moduleToChunk.get(normalizePath(possiblePath));
-            if (chunkFileName) {
-                return this.formatChunkReference(chunkFileName, jsExtMatch?.[0]);
+        // Try all file extensions that could appear as module IDs in Rollup's chunk metadata,
+        // probing both the path itself and a directory index
+        const extensions = ["", ".d.ts", ".d.mts", ".d.cts", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
+        const possiblePaths = [];
+        for (const base of [basePath, `${basePath}/index`]) {
+            for (const ext of extensions) {
+                possiblePaths.push(base + ext);
             }
         }
-        // Module is not found in any chunk, keep the current chunk name as a fallback
-        this.warn(`declare module "${absolutePath}" could not be resolved to any output chunk, falling back to current chunk "${this.chunkFileName}"`);
-        return this.formatChunkReference(this.chunkFileName, jsExtMatch?.[0]);
+        // Find which chunk contains this module
+        for (const possiblePath of possiblePaths) {
+            const moduleId = normalizePath(possiblePath);
+            const chunkFileName = this.moduleToChunk.get(moduleId);
+            if (chunkFileName) {
+                return { chunkFileName, moduleId, jsExt: jsExtMatch?.[0] };
+            }
+        }
+        return null;
+    }
+    /**
+     * Check that every augmented name is exported from the target chunk under its
+     * original name. Augmentation matches by exported name, so a name the chunk
+     * dropped, re-exported under an alias, or deconflicted (`Foo` → `Foo$1` when two
+     * modules in the chunk export a `Foo`) would merge into the wrong declaration.
+     */
+    augmentationApplies(names, moduleId, chunkFileName) {
+        const chunkInfo = this.chunks[chunkFileName];
+        if (!chunkInfo) {
+            return true;
+        }
+        const targetModule = Object.entries(chunkInfo.modules).find(([id]) => normalizePath(id) === moduleId)?.[1];
+        return names.every((name) => {
+            if (!targetModule?.renderedExports.includes(name) || !chunkInfo.exports.includes(name)) {
+                return false;
+            }
+            // A `name$<digits>` sibling export means this name was deconflicted within the
+            // chunk, and there is no way to tell which module's declaration kept the name
+            const deconflicted = new RegExp(`^${name.replace(/\$/g, "\\$")}\\$\\d+$`);
+            return !chunkInfo.exports.some((exportName) => deconflicted.test(exportName));
+        });
     }
     /**
      * Format a chunk filename as a relative path from the current chunk.
@@ -1284,6 +1439,11 @@ function preProcess({ sourceFile, isEntry, isJSON }) {
     // Resolve relative module declarations to absolute paths
     // This allows correct chunk resolution later even when files from different
     // directories are bundled together
+    //
+    // Deliberately limited to `./` / `../` specifiers: bare names (`declare module "vue"`)
+    // must stay untouched since consumers resolve them by package name, and tsconfig-paths
+    // aliases cannot be resolved lexically (see ModuleDeclarationFixer for the full
+    // mechanism and what alias support would require)
     const sourceDir = path__namespace.dirname(sourceFile.fileName);
     for (const node of sourceFile.statements) {
         if (ts.isModuleDeclaration(node) &&
@@ -1486,13 +1646,10 @@ const IGNORE_TYPENODES = new Set([
     ts.SyntaxKind.BigIntKeyword,
 ]);
 class DeclarationScope {
+    declaration;
+    iife;
+    returnExpr;
     constructor({ id, range }) {
-        /**
-         * As we walk the AST, we need to keep track of type variable bindings that
-         * shadow the outer identifiers. To achieve this, we keep a stack of scopes,
-         * represented as Sets of variable names.
-         */
-        this.scopes = [];
         if (id) {
             this.declaration = createDeclaration(id, range);
         }
@@ -1505,6 +1662,12 @@ class DeclarationScope {
         this.declaration.body.body.push(ret.stmt);
         this.returnExpr = ret.expr;
     }
+    /**
+     * As we walk the AST, we need to keep track of type variable bindings that
+     * shadow the outer identifiers. To achieve this, we keep a stack of scopes,
+     * represented as Sets of variable names.
+     */
+    scopes = [];
     pushScope() {
         this.scopes.push(new Set());
     }
@@ -1890,9 +2053,11 @@ function convert({ sourceFile }) {
     return transformer.transform();
 }
 class Transformer {
+    sourceFile;
+    ast;
+    declarations = new Map();
     constructor(sourceFile) {
         this.sourceFile = sourceFile;
-        this.declarations = new Map();
         this.ast = createProgram(sourceFile);
         for (const stmt of sourceFile.statements) {
             this.convertStatement(stmt);
@@ -2657,7 +2822,7 @@ const transform = (enableSourcemap) => {
             const moduleId = Array.from(moduleIds).find((id) => trimExtension(id) === name);
             const isEntry = Boolean(moduleId && this.getModuleInfo(moduleId)?.isEntry);
             const isJSON = Boolean(moduleId && JSON_EXTENSIONS.test(moduleId));
-            const inputMapText = typeof inputMapTextOrOptions === 'string' ? inputMapTextOrOptions : undefined;
+            const inputMapText = typeof inputMapTextOrOptions === "string" ? inputMapTextOrOptions : undefined;
             // Preserve original code for loadInputSourcemap() before preProcess strips sourceMappingURL
             const rawCode = code;
             let sourceFile = parse(fileName, code);
@@ -2689,7 +2854,7 @@ const transform = (enableSourcemap) => {
                     inputMapText,
                 });
             }
-            return { code, ast: converted.ast, map: map };
+            return { code, ast: converted.ast, map };
         },
         renderChunk(inputCode, chunk, options, meta) {
             const source = parse(chunk.fileName, inputCode);
@@ -2733,7 +2898,7 @@ const transform = (enableSourcemap) => {
                     moduleToChunk.set(moduleId.split("\\").join("/"), chunkFileName);
                 }
             }
-            const moduleDeclarationFixer = new ModuleDeclarationFixer(chunk, "magicCode" in typesFixed && typesFixed.magicCode ? typesFixed.magicCode : new MagicString(code), !!options.sourcemap, moduleToChunk, (message) => this.warn(message));
+            const moduleDeclarationFixer = new ModuleDeclarationFixer(chunk, "magicCode" in typesFixed && typesFixed.magicCode ? typesFixed.magicCode : new MagicString(code), !!options.sourcemap, moduleToChunk, meta.chunks, (message) => this.warn(message));
             return moduleDeclarationFixer.fix();
         },
         async generateBundle(options, bundle) {
@@ -2759,7 +2924,9 @@ const transform = (enableSourcemap) => {
                     // Resolve sourceRoot: preserve URLs verbatim, resolve filesystem paths
                     let sourceRoot;
                     if (inputMap.sourceRoot) {
-                        sourceRoot = isUrl(inputMap.sourceRoot) ? inputMap.sourceRoot : path__namespace.resolve(inputMapDir, inputMap.sourceRoot);
+                        sourceRoot = isUrl(inputMap.sourceRoot)
+                            ? inputMap.sourceRoot
+                            : path__namespace.resolve(inputMapDir, inputMap.sourceRoot);
                     }
                     else {
                         sourceRoot = inputMapDir;

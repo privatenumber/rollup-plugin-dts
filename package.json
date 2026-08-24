@@ -1,6 +1,6 @@
 {
   "name": "rollup-plugin-dts",
-  "version": "6.4.1",
+  "version": "6.5.1",
   "description": "A rollup plugin that will bundle up your .d.ts definition files.",
   "keywords": [
     "rollup-plugin",
@@ -48,24 +48,31 @@
     "trailingComma": "all"
   },
   "devDependencies": {
-    "@babel/code-frame": "^7.29.0",
+    "@babel/code-frame": "^8.0.0",
     "@jridgewell/trace-mapping": "^0.3.31",
     "@types/babel__code-frame": "^7.27.0",
     "@types/convert-source-map": "^2.0.3",
     "@types/d3-drag": "^3.0.7",
-    "@types/estree": "1.0.8",
-    "@types/node": "^25.5.0",
-    "@types/react": "^19.2.14",
-    "c8": "^11.0.0",
-    "rollup": "4.60.0",
-    "typescript": "5.9.3"
+    "@types/estree": "1.0.9",
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@typescript/native": "npm:typescript@^7.0.2",
+    "c8": "^12.0.0",
+    "rollup": "4.62.4",
+    "typescript": "npm:@typescript/typescript6@^6.0.2"
   },
   "peerDependencies": {
-    "rollup": "^3.29.4 || ^4",
-    "typescript": "^4.5 || ^5.0 || ^6.0"
+    "@typescript/typescript6": "^6",
+    "rollup": "^3 || ^4",
+    "typescript": "^4.5 || ^5 || ^6 || ^7"
+  },
+  "peerDependenciesMeta": {
+    "@typescript/typescript6": {
+      "optional": true
+    }
   },
   "optionalDependencies": {
-    "@babel/code-frame": "^7.29.0"
+    "@babel/code-frame": "^8.0.0"
   },
   "dependencies": {
     "@jridgewell/remapping": "^2.3.5",
@@ -75,7 +82,7 @@
   },
   "overrides": {
     "c8": {
-      "yargs": "^18.0.0"
+      "yargs": "^18.1.0"
     }
   }
 }
