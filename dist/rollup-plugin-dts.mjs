@@ -90,8 +90,6 @@ const DEFAULT_OPTIONS = {
     checkJs: false,
     declarationMap: false,
     skipLibCheck: true,
-    // Ensure TS2742 errors are visible
-    preserveSymlinks: true,
     // Ensure we can parse the latest code
     target: ts.ScriptTarget.ESNext,
     // Allows importing `*.json`
@@ -386,9 +384,18 @@ class NamespaceFixer {
             }
             const exports = [];
             for (const prop of obj.properties) {
-                if (!ts.isPropertyAssignment(prop) ||
+                // Rollup uses getters for namespace members involved in a cycle.
+                const getterReturn = ts.isGetAccessorDeclaration(prop) && prop.body?.statements.length === 1
+                    ? prop.body.statements[0]
+                    : undefined;
+                let initializer = ts.isPropertyAssignment(prop) ? prop.initializer : undefined;
+                if (getterReturn && ts.isReturnStatement(getterReturn)) {
+                    initializer = getterReturn.expression;
+                }
+                if (!prop.name ||
                     !(ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name)) ||
-                    (prop.name.text !== "__proto__" && !ts.isIdentifier(prop.initializer))) {
+                    !initializer ||
+                    (prop.name.text !== "__proto__" && !ts.isIdentifier(initializer))) {
                     throw new UnsupportedSyntaxError(prop, "Expected a property assignment");
                 }
                 if (prop.name.text === "__proto__") {
@@ -396,7 +403,7 @@ class NamespaceFixer {
                 }
                 exports.push({
                     exportedName: prop.name.text,
-                    localName: prop.initializer.getText(),
+                    localName: initializer.getText(),
                 });
             }
             // sort in reverse order, since we will do string manipulation
@@ -1117,6 +1124,141 @@ class ModuleDeclarationFixer {
     }
 }
 
+/**
+ * Qualifies type references that point to a global type through a name that
+ * the module also declares as a value or namespace:
+ *
+ * ```ts
+ * declare const PropertyKey: unique symbol;
+ * interface A { key: PropertyKey } // the global `PropertyKey` type
+ * ```
+ *
+ * TypeScript resolves the unqualified `PropertyKey` in a type position with
+ * the type meaning only, so it skips the local value. Rollup has a single
+ * namespace for names, so it binds the reference to the local value and
+ * renames both together, which makes the reference point to the value.
+ *
+ * Rewriting the reference to `globalThis.PropertyKey` keeps it pointing to the
+ * global type, and no bundled declaration can capture it.
+ */
+function qualifyShadowedGlobalTypeReferences(sourceFile, code) {
+    const values = collectValuesWithoutTypeMeaning(sourceFile);
+    if (values.size === 0) {
+        return;
+    }
+    const qualify = (name) => {
+        const root = getRootIdentifier(name);
+        if (!root) {
+            return;
+        }
+        const isNamespace = values.get(root.text);
+        // `A.B` resolves `A` with the namespace meaning, which a local namespace has
+        if (isNamespace === undefined || (isNamespace && root !== name)) {
+            return;
+        }
+        code.appendRight(root.getStart(), "globalThis.");
+    };
+    const visit = (node) => {
+        // Namespaces can merge with declarations in other files, which may
+        // declare the name in the namespace, so their bodies stay as they are.
+        if (ts.isModuleDeclaration(node)) {
+            return;
+        }
+        if (ts.isTypeReferenceNode(node)) {
+            qualify(node.typeName);
+        }
+        else if (ts.isExpressionWithTypeArguments(node) && isTypeHeritage(node)) {
+            qualify(node.expression);
+        }
+        ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+}
+/**
+ * Collects the top-level variables, functions, and namespaces whose names
+ * no other declaration in the module uses. Outside of namespaces, a type
+ * reference to such a name can only point to a global type. The value maps
+ * each name to whether it is declared as a namespace.
+ *
+ * Any other declaration of the name, such as an interface, an import, a type
+ * parameter, or a namespace member, can give the name a type meaning in some
+ * scope. Those names stay as they are.
+ */
+function collectValuesWithoutTypeMeaning(sourceFile) {
+    const values = new Map();
+    const valueNames = new Set();
+    const addValue = (name, isNamespace) => {
+        valueNames.add(name);
+        values.set(name.text, values.get(name.text) || isNamespace);
+    };
+    for (const stmt of sourceFile.statements) {
+        if (ts.isVariableStatement(stmt)) {
+            for (const decl of stmt.declarationList.declarations) {
+                if (ts.isIdentifier(decl.name)) {
+                    addValue(decl.name, false);
+                }
+            }
+        }
+        else if (ts.isFunctionDeclaration(stmt)) {
+            if (stmt.name) {
+                addValue(stmt.name, false);
+            }
+        }
+        else if (ts.isModuleDeclaration(stmt)) {
+            // `declare global` and `declare module "x"` do not declare a local name
+            if (ts.isIdentifier(stmt.name) && !(stmt.flags & ts.NodeFlags.GlobalAugmentation)) {
+                addValue(stmt.name, true);
+            }
+        }
+    }
+    if (values.size === 0) {
+        return values;
+    }
+    let declaresGlobalThis = false;
+    const visit = (node) => {
+        if (!ts.isIdentifier(node)) {
+            ts.forEachChild(node, visit);
+            return;
+        }
+        const { parent } = node;
+        if (
+        // exports and members do not declare a name in a scope
+        ts.isExportSpecifier(parent) ||
+            ts.isExportAssignment(parent) ||
+            ts.isTypeElement(parent) ||
+            ts.isClassElement(parent) ||
+            ts.isEnumMember(parent) ||
+            ts.getNameOfDeclaration(parent) !== node) {
+            return;
+        }
+        declaresGlobalThis ||= node.text === "globalThis";
+        if (!valueNames.has(node)) {
+            values.delete(node.text);
+        }
+    };
+    visit(sourceFile);
+    // A local `globalThis` would capture the inserted qualifier
+    return declaresGlobalThis ? new Map() : values;
+}
+function getRootIdentifier(node) {
+    if (ts.isIdentifier(node)) {
+        return node;
+    }
+    if (ts.isQualifiedName(node)) {
+        return getRootIdentifier(node.left);
+    }
+    if (ts.isPropertyAccessExpression(node)) {
+        return getRootIdentifier(node.expression);
+    }
+    return undefined;
+}
+/** A class `extends` clause references a value, all other heritage clauses reference types. */
+function isTypeHeritage(node) {
+    const clause = node.parent;
+    return (ts.isHeritageClause(clause) &&
+        (clause.token === ts.SyntaxKind.ImplementsKeyword || ts.isInterfaceDeclaration(clause.parent)));
+}
+
 function preProcessNamespaceBody(body, code, sourceFile) {
     // Recurse through dotted namespace chain (e.g. `namespace A.B.C {}`)
     if (ts.isModuleDeclaration(body)) {
@@ -1151,11 +1293,15 @@ function preProcessNamespaceBody(body, code, sourceFile) {
  */
 function preProcess({ sourceFile, isEntry, isJSON }) {
     const code = new MagicString(sourceFile.getFullText());
+    qualifyShadowedGlobalTypeReferences(sourceFile, code);
     // Only treat as global module if it's not an entry point,
     // otherwise the final output will be mismatched with the entry.
     const treatAsGlobalModule = !isEntry && isGlobalModule(sourceFile);
-    /** All the names that are declared in the `SourceFile`. */
-    const declaredNames = new Set();
+    /**
+     * All the names that are declared in the `SourceFile`, and `globalThis`,
+     * which qualified global type references use.
+     */
+    const declaredNames = new Set(["globalThis"]);
     /** All the names that are exported. */
     const exportedNames = new Set();
     /** The name of the default export. */
@@ -1666,8 +1812,14 @@ class DeclarationScope {
             name = id.name;
         }
         else if (id.type === "MemberExpression") {
-            if (id.object.type === "Identifier") {
-                name = id.object.name;
+            const { object, property } = id;
+            if (object.type === "Identifier") {
+                name = object.name;
+                if (property.type === "Identifier" && this.scopes.some((scope) => scope.has(property.name))) {
+                    // Keep the namespace qualifier: inlining its member would resolve
+                    // to the shadowing local type instead of the imported declaration.
+                    id = object;
+                }
             }
         }
         if (name) {
@@ -3187,7 +3339,11 @@ const plugin = (options = {}) => {
             };
             const treatTsAsDts = () => {
                 const declarationId = getDeclarationId(id);
-                const module = getModule(ctx, declarationId, code);
+                const declarationCode = ts.sys.readFile(declarationId);
+                if (declarationCode === undefined)
+                    return null;
+                this.addWatchFile(declarationId);
+                const module = getModule(ctx, declarationId, declarationCode);
                 if (module) {
                     watchFiles(module);
                     return transformPlugin.transform.call(this, module.code, declarationId);
